@@ -16,6 +16,7 @@
     bacon
     cargo-nextest
     sqlx-cli
+    tailwindcss
   ];
 
   # https://devenv.sh/languages/
@@ -24,6 +25,15 @@
     rust = {
       enable = true;
       channel = "stable";
+    };
+    javascript = {
+      enable = true;
+      bun = {
+        enable = true;
+      };
+    };
+    typescript = {
+      enable = true;
     };
   };
 

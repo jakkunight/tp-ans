@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="es-PY">
+	<head>
+		<link href="/assets/main.css" rel="stylesheet">
+		<!-- Allow any inheriting page to set it's own title -->
+		<title>{% block title %}{{ title }}{% endblock %}</title>
+
+		<!-- htmx from the unpkg CDN - your mileage may vary -->
+		<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js" integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V" crossorigin="anonymous"></script>
+
+		<!-- Allow any inheriting page to extend head with additional assets -->
+		{% block head %}{% endblock %}
+	</head>
+	<body>
+		<div id="content">
+			<!-- Inheriting pages will have their content rendered here, similar to app root in React, Angular, etc. -->
+			{% block content %}{% endblock %}
+		</div>
+	</body>
+</html>

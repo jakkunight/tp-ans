@@ -1,0 +1,5 @@
+[jobs.run]
+command = ["cargo", "run"]
+need_stdout = true
+watch = ["src", "templates"]
+on_change_strategy = "kill_then_restart"
