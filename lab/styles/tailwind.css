@@ -1,3 +1,40 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Caskaydia Code Nerd Font";
+  src: url("/assets/CaskaydiaCode/CaskaydiaCoveNerdFont-Regular.ttf");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@theme {
+  --font-caskaydia: "Caskaydia Cove Nerd Font", "monospace";
+  --color-background: #1F1F28;
+  --color-background-alt: #16161D;
+  --color-selection: #223249;
+  --color-comment: #54546D;
+
+  --color-foreground-alt: #727169;
+  --color-foreground: #DCD7BA;
+  --color-foreground-light: #C8C093;
+  --color-foreground-bright: #717C7C;
+
+  --color-red: #C34043;
+  --color-orange: #FFA066;
+  --color-yellow: #C0A36E;
+  --color-green: #76946A;
+  --color-cyan: #6A9589;
+  --color-blue: #7E9CD8;
+  --color-purple: #957FB8;
+  --color-brown: #D27E99;
+
+  --color-red-light: #E46876;
+  --color-orange-light: #FF5D62;
+  --color-yellow-light: #E6C384;
+  --color-green-light: #98BB6C;
+  --color-cyan-light: #A3D4D5;
+  --color-blue-light: #7FB4CA;
+  --color-purple-light: #9CABCA;
+  --color-brown-light: #E6A6BB;
+}

@@ -19,20 +19,33 @@ educativos.
 - Tailwind CSS
 - SQLx
 
-## Funcionamiento
+## Problema a resolver
 
-El prototipo consiste en dos servidores web que exponen una REST API. Uno
-corresponde al servicio de validación de facturas (farm) y otro que solicita la
-validación y al que los usuarios terminan subiendo sus facturas (lab).
+Un laboratorio de medicamentos (lab) cuenta con un programa de fidelización de
+clientes que consiste en el canje de productos adquiribles en las farmacias
+asociadas (farm) por puntos acumulables. Luego estos mismos puntos pueden
+cambiarse por otros productos habilitados.
 
-Un cliente puede ingresar al sistema a través de los endpoints especializados
-para tal efecto. Luego el servidor sirve el HTML y el CSS compilados y el
-cliente puede subir sus facturas para canjearlas por puntos, o cambiar sus
-puntos por productos seleccionados.
+Hasta ahora, el procesamiento de estos canjes se realizaba de forma manual. Una
+persona debía verificar la existencia de la compra realizada, revisar una tabla
+de canje de puntos por productos, actualizar los puntos acumulados del cliente.
+Verificar que los intercambios no puedan realizarse más de una sóla vez por
+venta, y recepcionar los cambios de productos por puntos y actualizar el saldo
+del cliente.
 
-Para validar las facturas, `lab` consulta a `farm` si efectivamente esta compra
-se dio. `farm` responde con los datos de la factura si esta existe. Sino,
-retorna un HTTP 404.
+El sistema debe automatizar este proceso y de ser posible, simplificarlo.
+
+## Especificaciones
+
+- El sistema **DEBE** permitir la carga y anulación de facturas por parte de una
+  farmacia asociada para el intercambio de automático de puntos en los productos
+  válidos.
+- El sistema **DEBE** permitir a los clientes del laboratorio el intercambio de
+  sus puntos por productos intercambiables.
+- El sistema **DEBE** permitir a los clientes autenticarse para realizar el
+  canje.
+- El sistema **DEBE** permitir a las farmacias asociadas al laboratorio
+  autenticar sus peticiones.
 
 ## Integrantes
 
