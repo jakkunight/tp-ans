@@ -16,14 +16,8 @@
 --   invoice and all its data (including already-earned points) remain intact.
 
 -- ============================================================
--- Labs / Partners
+-- Partners
 -- ============================================================
-
-create table labs (
-    id serial not null primary key,
-    name varchar(32) not null,
-    ruc varchar(32) not null
-);
 
 create table partners (
     id serial not null primary key,
@@ -54,21 +48,20 @@ create table clients (
 create table products (
     id serial not null primary key,
     name varchar(64) not null,
-    description varchar(128) not null default 'N/A',
-    points_cost int not null check (points_cost >= 0)
+    description varchar(128) not null default 'N/A'
 );
 
 -- Products that earn points when purchased
 create table promotion_products (
     id serial not null primary key,
-    product_id int not null references products(id) on delete cascade,
+    product_id int not null references products(id),
     points_cost int not null check (points_cost >= 1)
 );
 
 -- Products that can be redeemed for points
 create table redeemable_products (
     id serial not null primary key,
-    product_id int not null references products(id) on delete cascade,
+    product_id int not null references products(id),
     points_needed int not null check (points_needed >= 1)
 );
 
@@ -100,5 +93,3 @@ create table point_earnings (
     ticket_id int not null unique references tickets(id) on delete cascade,
     earned_points int not null check (earned_points >= 1)
 );
-
-

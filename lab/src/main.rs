@@ -1,3 +1,4 @@
+pub(crate) mod jwt;
 pub(crate) mod routes;
 
 use std::{env, sync::Arc};
