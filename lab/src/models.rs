@@ -6,9 +6,8 @@
 /// See `lab/database/schema.sql` for the full schema.
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use std::cmp::Ordering;
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 
 // ============================================================
 /// ## Partners

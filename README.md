@@ -53,13 +53,19 @@ El sistema debe automatizar este proceso y de ser posible, simplificarlo.
 
 ## Política de Uso de IA
 
-Si bien el uso de IA permite acelerar el desarrollo de los proyectos, en este
+~~Si bien el uso de IA permite acelerar el desarrollo de los proyectos, en este
 repositorio **NO SE ACEPTARÁN CONTRIBUCIONES REALIZADAS TOTAL O PARCIALMENTE CON
 IA**. Este es un proyecto con _fines didácticos y de aprendizaje_, por lo que
 creo conveniente y deseable **hacer un esfuerzo** por aprender el funcionamiento
 del mismo y sus tecnologías. Nadie inició siendo un experto en todo y yo no soy
 la excepción. Solamente empecé antes a estudiar, y eso me da una pequeña
-ventaja, pero también pueden alcanzarme si se esfuerzan.
+ventaja, pero también pueden alcanzarme si se esfuerzan.~~
+
+¿Por qué pasamos a aceptar contribuciones con IA?
+
+Porque en esta actividad sólo se evalúa la comprensión del problema y el diseño
+de una solución. No se evalúan ni la autoria ni la calidad per sé del código.
+Tampoco la comprensión de lo este último hace.
 
 ## Licenciamiento
 

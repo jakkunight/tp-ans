@@ -1,4 +1,5 @@
 pub(crate) mod jwt;
+pub(crate) mod models;
 pub(crate) mod routes;
 
 use std::{env, sync::Arc};
@@ -9,8 +10,8 @@ use tracing::info;
 
 use crate::routes::create_app;
 
-struct AppState {
-    db: PgPool,
+pub(crate) struct AppState {
+    pub(crate) db: PgPool,
 }
 
 #[tokio::main]

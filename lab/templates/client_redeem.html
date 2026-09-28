@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+
+{% block title %}Canjear puntos — {{ first_name }} {{ last_name }}{% endblock %}
+
+{% block content %}
+<main class="max-w-2xl mx-auto p-6 flex flex-col gap-6">
+  <section>
+    <h1 class="text-2xl font-bold">Canjear puntos</h1>
+    <p class="text-sm opacity-80">
+      Cliente: <strong>{{ first_name }} {{ last_name }}</strong>
+      (CI {{ ci }}, ID {{ client_id }})
+    </p>
+    <p class="mt-2">
+      Puntos acumulados: <strong id="points-balance">{{ balance_points }}</strong>
+      <span class="text-sm opacity-70">(ganados: {{ total_earned_points }})</span>
+    </p>
+  </section>
+
+  <section>
+    <h2 class="text-xl font-semibold mb-2">Productos canjeables</h2>
+    {% if products.is_empty() %}
+    <p class="text-sm">No hay productos canjeables por el momento.</p>
+    {% else %}
+    <form id="redeem-form" class="flex flex-col gap-2">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-left border-b">
+            <th class="py-2">Producto</th>
+            <th class="py-2">Puntos</th>
+            <th class="py-2">Cantidad</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in products %}
+          <tr class="border-b">
+            <td class="py-2">
+              <div class="font-semibold">{{ p.name }}</div>
+              <div class="opacity-70">{{ p.description }}</div>
+            </td>
+            <td class="py-2 font-mono">{{ p.points_needed }}</td>
+            <td class="py-2">
+              <input class="border rounded px-2 py-1 w-20" type="number"
+                     min="0" value="0" data-product-id="{{ p.product_id }}" />
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <button class="border rounded px-3 py-2 font-semibold mt-2" type="submit">Canjear</button>
+    </form>
+    <p id="redeem-message" class="text-sm mt-3" role="status"></p>
+    {% endif %}
+  </section>
+</main>
+<script>
+  const redeemForm = document.getElementById("redeem-form");
+  const redeemMsg = document.getElementById("redeem-message");
+  const clientId = {{ client_id }};
+  if (redeemForm) {
+    redeemForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (redeemMsg) redeemMsg.textContent = "";
+      const items = [];
+      redeemForm.querySelectorAll("input[data-product-id]").forEach((input) => {
+        const qty = Number(input.value || 0);
+        if (qty >= 1) {
+          items.push({ product_id: Number(input.dataset.productId), quantity: qty });
+        }
+      });
+      if (items.length === 0) {
+        if (redeemMsg) redeemMsg.textContent = "Elegí al menos un producto con cantidad mayor a cero.";
+        return;
+      }
+      const token = localStorage.getItem("lab_client_token");
+      let res;
+      try {
+        res = await fetch("/api/v1/clients/" + encodeURIComponent(String(clientId)) + "/redeem_points", {
+          method: "POST",
+          headers: Object.assign(
+            { "Content-Type": "application/json" },
+            token ? { "Authorization": "Bearer " + token } : {},
+          ),
+          body: JSON.stringify({ items }),
+        });
+      } catch {
+        if (redeemMsg) redeemMsg.textContent = "No se pudo contactar al servidor.";
+        return;
+      }
+      if (res.status === 409) {
+        if (redeemMsg) redeemMsg.textContent = "No tenés puntos suficientes para este canje.";
+        return;
+      }
+      if (!res.ok) {
+        if (redeemMsg) redeemMsg.textContent = "No se pudo completar el canje. Verificá los productos.";
+        return;
+      }
+      const payload = await res.json();
+      if (redeemMsg) {
+        redeemMsg.textContent =
+          "Canje exitoso: " + payload.redeemed_points + " puntos. Saldo restante: " + payload.remaining_points + ".";
+      }
+      const balance = document.getElementById("points-balance");
+      if (balance && payload.remaining_points !== undefined) {
+        balance.textContent = String(payload.remaining_points);
+      }
+      redeemForm.reset();
+    });
+  }
+</script>
+{% endblock %}

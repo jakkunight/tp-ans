@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}Identificarse — Clientes{% endblock %}
+
+{% block content %}
+<main class="max-w-md mx-auto p-6">
+  <h1 class="text-2xl font-bold mb-2">Identificarse</h1>
+  <p class="text-sm opacity-80 mb-4">
+    Ingresá tu CI, nombre y apellido para identificarte.
+    El dígito verificador (<span class="font-mono">CI-dígito</span>) es opcional y no se usa aquí.
+  </p>
+  <form id="client-login-form" class="flex flex-col gap-3">
+    <label class="flex flex-col gap-1">
+      <span>CI</span>
+      <input class="border rounded px-3 py-2" type="number" name="ci" min="0" required placeholder="Ej. 1234567" />
+    </label>
+    <label class="flex flex-col gap-1">
+      <span>Nombre</span>
+      <input class="border rounded px-3 py-2" type="text" name="first_name" maxlength="32" required placeholder="Ej. María" />
+    </label>
+    <label class="flex flex-col gap-1">
+      <span>Apellido</span>
+      <input class="border rounded px-3 py-2" type="text" name="last_name" maxlength="32" required placeholder="Ej. González" />
+    </label>
+    <button class="border rounded px-3 py-2 font-semibold" type="submit">Ingresar</button>
+  </form>
+  <p id="client-login-error" class="text-sm mt-3" role="alert"></p>
+</main>
+<script>
+  const form = document.getElementById("client-login-form");
+  const errBox = document.getElementById("client-login-error");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    errBox.textContent = "";
+    const data = new FormData(form);
+    const body = {
+      ci: Number(data.get("ci")),
+      first_name: String(data.get("first_name") || ""),
+      last_name: String(data.get("last_name") || ""),
+    };
+    let res;
+    try {
+      res = await fetch("/api/v1/clients/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      errBox.textContent = "No se pudo contactar al servidor.";
+      return;
+    }
+    if (!res.ok) {
+      errBox.textContent = "No se pudo identificar al cliente. Verificá tus datos.";
+      return;
+    }
+    const payload = await res.json();
+    if (payload && payload.token) {
+      localStorage.setItem("lab_client_token", payload.token);
+      // The JWT payload carries client_id; decode it to jump to the redeem page.
+      try {
+        const claims = JSON.parse(atob(payload.token.split(".")[1]));
+        const clientId = claims.client_id || claims.clientId || claims.sub;
+        if (clientId !== undefined && clientId !== null && String(clientId).length > 0) {
+          window.location.href = "/clients/" + encodeURIComponent(String(clientId)) + "/redeem";
+          return;
+        }
+      } catch {}
+      const manual = prompt("Sesión iniciada. Ingresá tu ID de cliente para continuar:");
+      if (manual) {
+        window.location.href = "/clients/" + encodeURIComponent(manual.trim()) + "/redeem";
+      }
+    }
+  });
+</script>
+{% endblock %}

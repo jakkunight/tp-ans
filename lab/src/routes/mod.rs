@@ -44,9 +44,9 @@ pub fn create_app(assets_path: PathBuf, state: Arc<AppState>) -> anyhow::Result<
 /// `access-control-allow-*` response headers, so browsers block the response.
 fn loopback_cors() -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            |origin: &HeaderValue, _| is_loopback_origin(origin),
-        ))
+        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+            is_loopback_origin(origin)
+        }))
         .allow_methods([
             Method::GET,
             Method::POST,
