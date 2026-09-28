@@ -3,9 +3,12 @@
 //! Two modes:
 //! * One-shot CLI (parity with `lab/scripts/post-ticket.sh`):
 //!   `post-ticket --partner 1 --ci 1234567 --first-name María --last-name González --item 1:2`
-//! * Interactive TUI (default when no action flags are given, or `--tui`).
+//! * Interactive TUI (default when no action flags are given, or `--tui`):
+//!   a scrollable, collapsible Ratatui form with unlimited product lines.
 //!
-//! HTTP is done with [`reqwest`], the interface with [`ratatui`].
+//! HTTP is done with [`reqwest`], the interface with [`ratatui`]. Request
+//! payloads mirror `lab/src/routes/api/dto.rs`; see [`Args`] for the flags
+//! and [`App`] for the TUI state.
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
@@ -23,30 +26,44 @@ use std::io::Stdout;
 // Payloads (mirror `routes::api::dto`)
 // ============================================================
 
+/// One `ticket_details` line: `product_id` purchased in `quantity` units.
 #[derive(Debug, Clone, Serialize)]
 struct TicketDetail {
+    /// `products.id` of the purchased product.
     product_id: i32,
+    /// Units purchased (`>= 1`).
     quantity: i32,
 }
 
+/// Buyer identity from the factura; the server registers him when unknown.
 #[derive(Debug, Clone, Serialize)]
 struct TicketClient {
+    /// `clients.ci` (unique) lookup key.
     ci: i32,
+    /// Optional `<ci>-<digit>` RUC suffix digit; omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_digit: Option<i32>,
+    /// Buyer first name as printed on the factura.
     first_name: String,
+    /// Buyer last name as printed on the factura.
     last_name: String,
 }
 
+/// Body for `POST /api/v1/partners/tickets`.
 #[derive(Debug, Clone, Serialize)]
 struct CreateTicketRequest {
+    /// `partners.id` of the issuing pharmacy.
     partner_id: i32,
+    /// Buyer data; registered on the fly when the CI is unknown.
     client: TicketClient,
+    /// At least one product line.
     details: Vec<TicketDetail>,
 }
 
+/// Body for `DELETE /api/v1/partners/tickets`.
 #[derive(Debug, Clone, Serialize)]
 struct DeleteTicketRequest {
+    /// `tickets.id` of the invoice to void.
     ticket_id: i32,
 }
 
@@ -55,13 +72,17 @@ struct DeleteTicketRequest {
 /// optional pre-shared credential.
 #[derive(Debug, Clone, Serialize)]
 struct PartnerLoginRequest {
+    /// `partners.ruc` of the pharmacy logging in.
     ruc: String,
+    /// Optional pre-shared credential; omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     secret: Option<String>,
 }
 
+/// Successful login reply (`LoginResponse`): the JWT to reuse as a bearer token.
 #[derive(Debug, Clone, Deserialize)]
 struct LoginReply {
+    /// Compact JWT for `Authorization: Bearer <token>`.
     token: String,
 }
 
@@ -69,24 +90,40 @@ struct LoginReply {
 // CLI args (manual parsing, no extra deps)
 // ============================================================
 
+/// Parsed command-line flags (manual parsing, no extra deps).
 #[derive(Debug, Default)]
 struct Args {
+    /// Force the interactive TUI even with action flags present.
     tui: bool,
+    /// `--partner`: issuing pharmacy id.
     partner: Option<String>,
+    /// `--ci`: buyer CI from the factura.
     ci: Option<String>,
+    /// `--first-name`: buyer first name.
     first_name: Option<String>,
+    /// `--last-name`: buyer last name.
     last_name: Option<String>,
+    /// `--verification-digit`: optional RUC suffix digit.
     verification_digit: Option<String>,
+    /// `--item` values (`PID:QTY`, repeatable).
     items: Vec<String>,
+    /// `--base-url`: API base URL override.
     base_url: Option<String>,
+    /// `--token`: bearer JWT override.
     token: Option<String>,
+    /// `--login-partner`: partner RUC to log in with.
     login_partner: Option<String>,
+    /// `--login-secret`: optional login credential.
     login_secret: Option<String>,
+    /// `--delete`: ticket id to void.
     delete: Option<String>,
+    /// `--dry-run`: print the JSON body without sending it.
     dry_run: bool,
+    /// `-h` / `--help`: print [`HELP`].
     help: bool,
 }
 
+/// One-shot usage text, also printed for `--help`.
 const HELP: &str = r#"post-ticket — post tickets to the lab API from the terminal.
 
 Usage (one-shot):
@@ -136,6 +173,7 @@ Seed data (lab/database/seed.sql):
             4 Crema (3 pts), 5 Termo (canje 100 pts), 6 Mochila (canje 250 pts)
 "#;
 
+/// Parses `std::env::args` into [`Args`]; unknown flags are an error.
 fn parse_args() -> Result<Args> {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1).peekable();
@@ -170,6 +208,8 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
+/// Resolves the API base URL: `--base-url`, then `LAB_BASE_URL`, then the
+/// `127.0.0.1:8080` default (trailing slashes stripped).
 fn base_url(args: &Args) -> String {
     args.base_url
         .clone()
@@ -179,6 +219,8 @@ fn base_url(args: &Args) -> String {
         .to_string()
 }
 
+/// Resolves the bearer JWT: `--token`, then `LAB_JWT_TOKEN`, else empty
+/// (the API currently accepts unauthenticated calls).
 fn token(args: &Args) -> String {
     args.token
         .clone()
@@ -186,6 +228,7 @@ fn token(args: &Args) -> String {
         .unwrap_or_default()
 }
 
+/// Parses a `>= 1` id (partner, product, quantity, ticket).
 fn parse_id(raw: &str, what: &str) -> Result<i32> {
     raw.trim()
         .parse::<i32>()
@@ -199,6 +242,7 @@ fn parse_id(raw: &str, what: &str) -> Result<i32> {
         })
 }
 
+/// Parses a buyer CI (`>= 0`, per the `ci >= 0` column check).
 fn parse_ci(raw: &str) -> Result<i32> {
     raw.trim()
         .parse::<i32>()
@@ -212,6 +256,7 @@ fn parse_ci(raw: &str) -> Result<i32> {
         })
 }
 
+/// Parses a `<ci>-<digit>` RUC suffix digit (`0-9`).
 fn parse_vdigit(raw: &str) -> Result<i32> {
     raw.trim()
         .parse::<i32>()
@@ -225,6 +270,7 @@ fn parse_vdigit(raw: &str) -> Result<i32> {
         })
 }
 
+/// Requires a non-blank flag value (buyer names), trimmed.
 fn non_empty(raw: Option<&str>, flag: &str) -> Result<String> {
     let v = raw
         .context(format!("{flag} is required"))?
@@ -236,6 +282,8 @@ fn non_empty(raw: Option<&str>, flag: &str) -> Result<String> {
     Ok(v)
 }
 
+/// Builds the ticket buyer from raw flag/field values, validating CI, names
+/// and the optional verification digit.
 fn build_client(
     ci: Option<&str>,
     first_name: Option<&str>,
@@ -290,6 +338,7 @@ fn expand_item_lines(raw_items: &[String]) -> Vec<String> {
     }
 }
 
+/// Pretty-prints a JSON response body, passing non-JSON through untouched.
 fn pretty_json(raw: &str) -> String {
     serde_json::from_str::<serde_json::Value>(raw)
         .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.to_string()))
@@ -300,12 +349,15 @@ fn pretty_json(raw: &str) -> String {
 // HTTP via reqwest
 // ============================================================
 
+/// Builds a [`reqwest`] client with defaults.
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .build()
         .context("failed to build HTTP client")
 }
 
+/// `POST`s a ticket; returns the HTTP status plus the pretty reply body.
+/// Sends `Authorization: Bearer` only when `token` is non-empty.
 async fn post_ticket_reqwest(
     base: &str,
     token: &str,
@@ -323,6 +375,7 @@ async fn post_ticket_reqwest(
     Ok((status, pretty_json(&body)))
 }
 
+/// `DELETE`s a ticket by id; returns the HTTP status plus the pretty reply body.
 async fn delete_ticket_reqwest(
     base: &str,
     token: &str,
@@ -340,6 +393,7 @@ async fn delete_ticket_reqwest(
     Ok((status, pretty_json(&body)))
 }
 
+/// Logs a partner in by RUC; returns the HTTP status plus the pretty reply body.
 async fn partner_login_reqwest(
     base: &str,
     ruc: &str,
@@ -374,6 +428,8 @@ fn extract_token(pretty_body: &str) -> Result<String> {
 // One-shot CLI mode
 // ============================================================
 
+/// Runs the one-shot CLI: optional login, then at most one delete/post action.
+/// Prints `HTTP <status>` plus the pretty body; non-2xx is an error.
 async fn run_oneshot(args: &Args) -> Result<()> {
     let base = base_url(args);
     let mut tok = token(args);
@@ -464,26 +520,44 @@ async fn run_oneshot(args: &Args) -> Result<()> {
 // ============================================================
 
 // Indices into App::fields (fixed order).
+/// Base URL text field.
 const FIELD_BASE: usize = 0;
+/// JWT token text field (masked on screen).
 const FIELD_TOKEN: usize = 1;
+/// Partner login RUC text field.
 const FIELD_LOGIN_RUC: usize = 2;
+/// Partner login secret text field (masked on screen).
 const FIELD_LOGIN_SECRET: usize = 3;
+/// Ticket partner id text field.
 const FIELD_PARTNER: usize = 4;
+/// Buyer CI text field.
 const FIELD_CI: usize = 5;
+/// Buyer first-name text field.
 const FIELD_FIRST: usize = 6;
+/// Buyer last-name text field.
 const FIELD_LAST: usize = 7;
+/// Buyer verification-digit text field.
 const FIELD_VDIGIT: usize = 8;
+/// Ticket id to void text field.
 const FIELD_DELETE: usize = 9;
+/// Number of fixed text fields.
 const TEXT_FIELDS: usize = 10;
 
 // Collapsible sections.
-const SECTION_COUNT: usize = 5;
+/// Connection section: base URL + token.
 const SEC_CONN: usize = 0;
+/// Partner-login section: RUC + secret.
 const SEC_LOGIN: usize = 1;
+/// Invoice section: partner id + buyer data.
 const SEC_TICKET: usize = 2;
+/// Products section: dynamic `PID:QTY` lines.
 const SEC_ITEMS: usize = 3;
+/// Void section: ticket id to delete.
 const SEC_VOID: usize = 4;
+/// Number of collapsible sections.
+const SECTION_COUNT: usize = 5;
 
+/// Display names of the collapsible TUI sections, in order.
 const SECTION_NAMES: [&str; SECTION_COUNT] = [
     "Conexión",
     "Login partner",
@@ -492,35 +566,51 @@ const SECTION_NAMES: [&str; SECTION_COUNT] = [
     "Anular ticket",
 ];
 
+/// Login button id (see [`Focus::Button`]).
 const BTN_LOGIN: usize = 0;
+/// Post-ticket button id.
 const BTN_POST: usize = 1;
+/// Void-ticket button id.
 const BTN_DELETE: usize = 2;
 
+/// Height in terminal rows of every form row.
 const ROW_H: u16 = 3;
 
 /// Anything the cursor can stop on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
+    /// A collapsible section header (`SECTION_NAMES` index).
     Section(usize),
+    /// A fixed text field (`FIELD_*` index into [`App::fields`]).
     Field(usize),
+    /// A dynamic product line (`App::items` index).
     Item(usize),
+    /// An action button (`BTN_*` id).
     Button(usize),
 }
 
 /// One rendered row of the scrollable form.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RowKind {
+    /// Static title banner (never focusable).
     Title,
+    /// Collapsible section header.
     Section(usize),
+    /// Fixed text field.
     Field(usize),
+    /// Dynamic product line.
     Item(usize),
+    /// The login/post/void button row.
     Buttons,
 }
 
+/// Interactive TUI state: form contents, collapse flags, cursor and viewport.
 struct App {
+    /// Fixed text field contents, indexed by `FIELD_*`.
     fields: [String; TEXT_FIELDS],
     /// Product lines, one `PID:QTY` entry per line (separators also split).
     items: Vec<String>,
+    /// Per-section fold state, indexed by `SEC_*`.
     collapsed: [bool; SECTION_COUNT],
     /// Index into [`App::focusables`].
     focus: usize,
@@ -528,11 +618,14 @@ struct App {
     scroll: usize,
     /// Last measured form height (rows), for page jumps.
     last_form_h: u16,
+    /// Last action result shown in the response pane.
     message: String,
+    /// Whether an HTTP round-trip is in flight.
     busy: bool,
 }
 
 impl App {
+    /// Seeds the form from CLI flags/env, cursor on the partner id field.
     fn new(args: &Args) -> Self {
         let fields = [
             base_url(args),
@@ -639,6 +732,7 @@ impl App {
         r
     }
 
+    /// Currently focused stop, clamped into [`App::focusables`].
     fn focus_item(&self) -> Focus {
         let items = self.focusables();
         if items.is_empty() {
@@ -647,6 +741,7 @@ impl App {
         items[self.focus.min(items.len() - 1)]
     }
 
+    /// Moves the cursor to the next focus stop, wrapping around.
     fn next(&mut self) {
         let n = self.focusables().len();
         if n > 0 {
@@ -654,6 +749,7 @@ impl App {
         }
     }
 
+    /// Moves the cursor to the previous focus stop, wrapping around.
     fn prev(&mut self) {
         let n = self.focusables().len();
         if n > 0 {
@@ -661,6 +757,7 @@ impl App {
         }
     }
 
+    /// Jumps the cursor by roughly one viewport page (`dir`: `+1` down, `-1` up).
     fn page(&mut self, dir: i32) {
         let step = ((self.last_form_h / ROW_H) as usize).max(1);
         let n = self.focusables().len();
@@ -671,10 +768,12 @@ impl App {
         self.focus = f.clamp(0, n as i32 - 1) as usize;
     }
 
+    /// Whether the cursor sits on a section header (where `Espacio` folds).
     fn is_section_focus(&self) -> bool {
         matches!(self.focus_item(), Focus::Section(_))
     }
 
+    /// Folds/unfolds the focused section, keeping the cursor on its header.
     fn toggle_section(&mut self) {
         if let Focus::Section(s) = self.focus_item() {
             self.collapsed[s] = !self.collapsed[s];
@@ -687,6 +786,7 @@ impl App {
         }
     }
 
+    /// Product-line index under the cursor, if any.
     fn focused_item(&self) -> Option<usize> {
         match self.focus_item() {
             Focus::Item(i) => Some(i),
@@ -694,6 +794,7 @@ impl App {
         }
     }
 
+    /// Inserts a blank product line below the focused one and moves to it.
     fn add_item_line(&mut self) {
         if let Some(i) = self.focused_item() {
             self.items.insert(i + 1, String::new());
@@ -705,6 +806,8 @@ impl App {
         }
     }
 
+    /// Removes the focused product line (clearing it when it is the last one,
+    /// so posting stays possible).
     fn remove_item_line(&mut self) {
         if let Some(i) = self.focused_item() {
             if self.items.len() > 1 {
@@ -721,6 +824,8 @@ impl App {
         }
     }
 
+    /// One-line header summary per section (token presence, line count).
+    /// Never includes secret values.
     fn section_summary(&self, s: usize) -> String {
         match s {
             SEC_CONN => {
@@ -742,6 +847,7 @@ impl App {
         }
     }
 
+    /// Posts the form ticket, reporting the outcome in the response pane.
     async fn do_post(&mut self) {
         match self.try_post().await {
             Ok(msg) => self.message = msg,
@@ -749,6 +855,7 @@ impl App {
         }
     }
 
+    /// Logs the partner in, reporting the outcome in the response pane.
     async fn do_login(&mut self) {
         match self.try_login().await {
             Ok(msg) => self.message = msg,
@@ -756,6 +863,8 @@ impl App {
         }
     }
 
+    /// Performs the login round-trip; on success stores the JWT in the token
+    /// field and returns a confirmation that never echoes the token itself.
     async fn try_login(&mut self) -> Result<String> {
         let base = self.fields[FIELD_BASE]
             .trim()
@@ -787,6 +896,8 @@ impl App {
         Ok(format!("LOGIN → HTTP {status} (token stored)"))
     }
 
+    /// Validates the form and performs the ticket round-trip, returning the
+    /// `POST → HTTP <status>` line plus the pretty body for the response pane.
     async fn try_post(&mut self) -> Result<String> {
         let base = self.fields[FIELD_BASE]
             .trim()
@@ -814,6 +925,7 @@ impl App {
         Ok(format!("POST → HTTP {status}\n{body}"))
     }
 
+    /// Voids the ticket id in the form, reporting the outcome in the response pane.
     async fn do_delete(&mut self) {
         match self.try_delete().await {
             Ok(msg) => self.message = msg,
@@ -821,6 +933,8 @@ impl App {
         }
     }
 
+    /// Performs the void round-trip, returning the `DELETE → HTTP <status>`
+    /// line plus the pretty body for the response pane.
     async fn try_delete(&mut self) -> Result<String> {
         let base = self.fields[FIELD_BASE]
             .trim()
@@ -836,6 +950,7 @@ impl App {
     }
 }
 
+/// Builds a titled input box, highlighted yellow when focused.
 fn input_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
     let style = if focused {
         Style::default().fg(Color::Yellow)
@@ -848,6 +963,7 @@ fn input_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
         .border_style(style)
 }
 
+/// On-screen titles of the fixed text fields, indexed by `FIELD_*`.
 const FIELD_TITLES: [&str; TEXT_FIELDS] = [
     "Base URL",
     "JWT token (optional, filled by login)",
@@ -861,10 +977,14 @@ const FIELD_TITLES: [&str; TEXT_FIELDS] = [
     "Ticket ID (para anular)",
 ];
 
+/// Whether a fixed field holds a secret (masked with `•` on screen).
 fn is_secret_field(i: usize) -> bool {
     i == FIELD_TOKEN || i == FIELD_LOGIN_SECRET
 }
 
+/// Renders one frame: the visible slice of the scrollable form (keeping the
+/// focused row in view), the pinned response pane and the help footer.
+/// Secrets on screen stay masked; the cursor tracks the focused text.
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let outer = Layout::default()
@@ -1045,6 +1165,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// Appends a typed character to the focused text field or product line.
 fn on_char(app: &mut App, c: char) {
     match app.focus_item() {
         Focus::Field(i) => app.fields[i].push(c),
@@ -1057,6 +1178,7 @@ fn on_char(app: &mut App, c: char) {
     }
 }
 
+/// Deletes the last character of the focused text field or product line.
 fn on_backspace(app: &mut App) {
     match app.focus_item() {
         Focus::Field(i) => {
@@ -1071,6 +1193,8 @@ fn on_backspace(app: &mut App) {
     }
 }
 
+/// Runs the fullscreen TUI event loop until `Esc`/`Ctrl+C`, then prints the
+/// last response line to stdout for scripting.
 async fn run_tui(args: &Args) -> Result<()> {
     crossterm::terminal::enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = std::io::stdout();
@@ -1151,6 +1275,8 @@ async fn run_tui(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Entry point: `--help` prints [`HELP`]; action flags select the one-shot
+/// CLI, otherwise (or with `--tui`) the interactive form runs.
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
@@ -1174,6 +1300,7 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+/// Unit tests for the TUI form model (focus order, folding, product lines).
 mod tests {
     use super::*;
 

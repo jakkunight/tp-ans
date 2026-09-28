@@ -1,3 +1,10 @@
+//! # Server-rendered client pages.
+//!
+//! Askama + HTMX interface for end customers: self-identification at
+//! `GET /clients/login` and the points-redemption dashboard at
+//! `GET /clients/{client_id}/redeem`. The pages call the JSON REST API
+//! ([`crate::routes::api`]) from the browser, carrying the client JWT from
+//! `localStorage`.
 use std::sync::Arc;
 
 use askama::Template;
@@ -12,6 +19,12 @@ use tracing::error;
 
 use crate::{AppState, models::Clients};
 
+/// Builds the frontend router: `/`, `/clients/login` and
+/// `/clients/{client_id}/redeem`.
+///
+/// # Errors
+///
+/// Currently infallible; returns [`anyhow::Error`] to allow future fallible setup.
 pub fn create_frontend() -> anyhow::Result<Router<Arc<AppState>>> {
     Ok(Router::new()
         .route("/", get(root))
@@ -19,6 +32,7 @@ pub fn create_frontend() -> anyhow::Result<Router<Arc<AppState>>> {
         .route("/clients/{client_id}/redeem", get(client_redeem_page)))
 }
 
+/// Static fallback page served when an Askama template fails to render.
 const ERROR_HTML: &str = r#"
 <!doctype html>
 <html lang="en">
@@ -37,8 +51,10 @@ const ERROR_HTML: &str = r#"
 
 #[derive(Template)]
 #[template(path = "root.html")]
+/// Landing page template (`templates/root.html`).
 struct RootTemplate {}
 
+/// `GET /` — renders the landing page.
 pub async fn root() -> impl IntoResponse {
     let t = RootTemplate {};
     render_or_error(t)
@@ -50,6 +66,7 @@ pub async fn root() -> impl IntoResponse {
 
 #[derive(Template)]
 #[template(path = "client_login.html")]
+/// Self-identification form template (`templates/client_login.html`).
 struct ClientLoginTemplate {}
 
 /// Login page where a client identifies with CI + first/last name.
@@ -64,22 +81,36 @@ pub async fn client_login_page() -> impl IntoResponse {
 // ============================================================
 
 #[derive(Debug, Clone)]
+/// One row of the redeemable-products table: a `products` entry joined with
+/// its `redeemable_products` price.
 struct RedeemableProductView {
+    /// `products.id` to send back in redemption items.
     product_id: i32,
+    /// `products.name` display label.
     name: String,
+    /// `products.description` display subtitle.
     description: String,
+    /// `redeemable_products.points_needed` cost per unit.
     points_needed: i32,
 }
 
 #[derive(Template)]
 #[template(path = "client_redeem.html")]
+/// Points dashboard template (`templates/client_redeem.html`).
 struct ClientRedeemTemplate {
+    /// `clients.id` of the dashboard owner (also the redeem route id).
     client_id: i32,
+    /// `clients.ci` display value.
     ci: i32,
+    /// `clients.first_name` display value.
     first_name: String,
+    /// `clients.last_name` display value.
     last_name: String,
+    /// Sum of `point_earnings` over his tickets.
     total_earned_points: i32,
+    /// Spendable points (equals earned until redemptions persist).
     balance_points: i32,
+    /// Redeemable catalog, ordered by product name.
     products: Vec<RedeemableProductView>,
 }
 
@@ -150,6 +181,7 @@ pub async fn client_redeem_page(
     Ok(render_or_error(template))
 }
 
+/// Renders `template`, falling back to a static error page when Askama fails.
 fn render_or_error<T: Template>(template: T) -> Html<String> {
     match template.render() {
         Ok(h) => Html(h),

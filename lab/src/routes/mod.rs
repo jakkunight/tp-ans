@@ -1,3 +1,9 @@
+//! # HTTP routes.
+//!
+//! Composes the JSON REST API ([`api`], under `/api/v1/...`), the
+//! server-rendered pages ([`frontend`]) and the static `/assets` dir into a
+//! single Axum [`Router`] via [`create_app`]. A loopback-only CORS layer
+//! restricts browser access to origins served from `127.0.0.1`.
 pub(crate) mod api;
 pub(crate) mod frontend;
 
@@ -20,10 +26,23 @@ use crate::{
 
 #[derive(Template)]
 #[template(path = "base.html")]
+/// Layout template behind [`create_app`] error pages.
 struct BaseTemplate {
+    /// Page `<title>` rendered into `base.html`.
     title: &'static str,
 }
 
+/// Builds the full application router: static assets, [`api`], [`frontend`],
+/// loopback CORS and shared [`AppState`].
+///
+/// # Arguments
+///
+/// * `assets_path` — directory served verbatim at `/assets`.
+/// * `state` — shared [`AppState`] (Postgres pool) given to every handler.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if the API or frontend routers fail to build.
 pub fn create_app(assets_path: PathBuf, state: Arc<AppState>) -> anyhow::Result<Router> {
     let p = assets_path
         .as_path()

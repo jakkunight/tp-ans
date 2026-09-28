@@ -1,3 +1,22 @@
+//! # lab — Sistema de Validación de Facturas.
+//!
+//! Backend binary for the laboratory loyalty-points system: pharmacies
+//! ([`partners`](crate::models::Partners)) upload invoices (tickets) that
+//! award points to clients, and clients redeem those points for products.
+//!
+//! The HTTP surface is split into a JSON REST API
+//! ([`routes::api`], served under `/api/v1/...`) and server-rendered pages
+//! ([`routes::frontend`], Askama + HTMX). Authentication uses JWT claims
+//! defined in [`jwt`]. All persistence goes through the Postgres pool held
+//! by [`AppState`]; the schema lives in `lab/database/schema.sql`.
+//!
+//! ## Required environment
+//!
+//! * `LAB_DB_URL` — Postgres connection string.
+//! * `LAB_JWT_SECRET` — HMAC secret used to sign/verify JWTs.
+//!
+//! The server listens on `127.0.0.1:8080`.
+#![deny(missing_docs)]
 pub(crate) mod jwt;
 pub(crate) mod models;
 pub(crate) mod routes;
@@ -10,10 +29,13 @@ use tracing::info;
 
 use crate::routes::create_app;
 
+/// Shared state injected into every handler via Axum's [`State`](axum::extract::State).
 pub(crate) struct AppState {
+    /// Postgres connection pool (see `lab/database/schema.sql`).
     pub(crate) db: PgPool,
 }
 
+/// Bootstraps tracing, connects the [`PgPool`], builds the app and serves it.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let subscriber = tracing_subscriber::fmt().compact().finish();

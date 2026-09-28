@@ -1,3 +1,19 @@
+//! # JSON REST API (`/api/v1/...`).
+//!
+//! Request/response shapes live in [`dto`]; every DTO derives [`Clone`],
+//! [`Serialize`](serde::Serialize) and [`Deserialize`](serde::Deserialize).
+//! Handlers query Postgres through [`crate::AppState`] and mint
+//! JWTs via [`crate::jwt`]. Traces carry numeric ids/counts only —
+//! credentials (CI, names, RUC, secrets) and tokens are never logged.
+//!
+//! | Method & path | Handler | Auth |
+//! |---|---|---|
+//! | `POST /api/v1/partners/login` | [`partner_login`] | public |
+//! | `POST /api/v1/clients/login` | [`client_login`] | public |
+//! | `POST /api/v1/partners/tickets` | [`add_ticket`] | partner JWT |
+//! | `DELETE /api/v1/partners/tickets` | [`delete_ticket`] | partner JWT |
+//! | `GET /api/v1/clients/{client_id}` | [`get_client_data`] | client JWT |
+//! | `POST /api/v1/clients/{client_id}/redeem_points` | [`redeem_points`] | client JWT |
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -29,6 +45,12 @@ pub mod dto;
 // non-sensitive fields (numeric DB ids, counts, point totals). Credentials
 // (CI, names, RUC, secrets) and JWT tokens are NEVER logged.
 
+/// Builds the `/api/v1/...` router: two public login routes plus the
+/// ticket/client routes (intended to sit behind [`jwt_middleware`](crate::jwt::jwt_middleware)).
+///
+/// # Errors
+///
+/// Currently infallible; returns [`anyhow::Error`] to allow future fallible setup.
 pub fn create_api() -> anyhow::Result<Router<Arc<AppState>>> {
     let public_api = Router::new()
         .route("/api/v1/partners/login", post(partner_login))
@@ -45,6 +67,17 @@ pub fn create_api() -> anyhow::Result<Router<Arc<AppState>>> {
     Ok(router)
 }
 
+/// `POST /api/v1/clients/login` — identifies a client and mints his JWT.
+///
+/// Checks `ci` + `first_name` + `last_name` against `clients` (`ci` alone is
+/// unique; the verification digit is optional data and is not checked) and
+/// returns a [`LoginResponse`] whose token expires after 1 hour.
+///
+/// # Status codes
+///
+/// * `200` with the token on success.
+/// * `401` for unknown credentials.
+/// * `500` on DB or token-signing failures.
 #[tracing::instrument(skip(state, credentials), name = "client_login")]
 pub async fn client_login(
     State(state): State<Arc<AppState>>,
@@ -85,6 +118,18 @@ pub async fn client_login(
     Ok(Json(LoginResponse::bearer(token)))
 }
 
+/// `POST /api/v1/partners/login` — authenticates a pharmacy and mints its JWT.
+///
+/// Looks the partner up by `ruc` (must be active) and returns a
+/// [`LoginResponse`]. The optional request `secret` is echoed into
+/// [`crate::jwt::PartnerClaims`]; the token itself carries no expiry.
+///
+/// # Status codes
+///
+/// * `200` with the token on success.
+/// * `401` for an unknown `ruc`.
+/// * `403` for an inactive partner.
+/// * `500` on DB or token-signing failures.
 #[tracing::instrument(skip(state, credentials), name = "partner_login")]
 pub async fn partner_login(
     State(state): State<Arc<AppState>>,
@@ -124,6 +169,22 @@ pub async fn partner_login(
     Ok(Json(LoginResponse::bearer(token)))
 }
 
+/// `POST /api/v1/partners/tickets` — registers an invoice and awards points.
+///
+/// Validates the buyer data from the factura, registers the client on the
+/// fly (find-or-create by unique `ci`), then — inside one transaction —
+/// inserts the `tickets` row, its `ticket_details` lines and, when at least
+/// one point was earned (`quantity × promotion_products.points_cost`), the
+/// `point_earnings` snapshot. Responds with the new `ticket_id`, the
+/// resolved `client_id` and the awarded points.
+///
+/// # Status codes
+///
+/// * `200` with [`CreateTicketResponse`] on success.
+/// * `400` for empty/invalid lines or buyer data.
+/// * `403` for an inactive partner.
+/// * `404` for an unknown partner or product.
+/// * `500` on DB failures.
 #[tracing::instrument(
     skip(state, request),
     fields(
@@ -350,6 +411,16 @@ pub async fn add_ticket(
     }))
 }
 
+/// `DELETE /api/v1/partners/tickets` — voids an invoice by id from the body.
+///
+/// The delete cascades to `ticket_details` and `point_earnings` via
+/// `ON DELETE CASCADE`.
+///
+/// # Status codes
+///
+/// * `200` with [`DeleteTicketResponse`] when a row was deleted.
+/// * `404` when no ticket with that id exists.
+/// * `500` on DB failures.
 #[tracing::instrument(skip(state, request), fields(ticket_id = request.ticket_id))]
 pub async fn delete_ticket(
     State(state): State<Arc<AppState>>,
@@ -384,6 +455,13 @@ pub async fn delete_ticket(
     }
 }
 
+/// Sums the `point_earnings` snapshots of every ticket owned by a client.
+///
+/// Helper shared by [`get_client_data`] and [`redeem_points`].
+///
+/// # Errors
+///
+/// Returns [`StatusCode::INTERNAL_SERVER_ERROR`] when the `SUM` query fails.
 #[tracing::instrument(skip(db), fields(client_id))]
 async fn total_earned_points(db: &sqlx::PgPool, client_id: i32) -> Result<i32, StatusCode> {
     let total: Option<i64> = sqlx::query_scalar(
@@ -400,6 +478,18 @@ async fn total_earned_points(db: &sqlx::PgPool, client_id: i32) -> Result<i32, S
     Ok(total.unwrap_or(0).try_into().unwrap_or(i32::MAX))
 }
 
+/// `GET /api/v1/clients/{client_id}` — serves the points dashboard payload.
+///
+/// Returns the client profile, the earned/redeemed/balance breakdown and the
+/// full ticket history with per-ticket details and `point_earnings`
+/// snapshots. Redeemed history is `0` until a `redemptions` table exists
+/// (redemption totals are derived, never stored).
+///
+/// # Status codes
+///
+/// * `200` with [`ClientDataResponse`] on success.
+/// * `404` for an unknown client.
+/// * `500` on DB failures.
 #[tracing::instrument(skip(state), fields(client_id))]
 pub async fn get_client_data(
     State(state): State<Arc<AppState>>,
@@ -498,6 +588,22 @@ pub async fn get_client_data(
     }))
 }
 
+/// `POST /api/v1/clients/{client_id}/redeem_points` — prices a points redemption.
+///
+/// Validates every line against `redeemable_products`, derives the cost as
+/// `Σ quantity × points_needed` and rejects the request when the balance
+/// (`total_earned − redeemed`) would go negative. Nothing is persisted yet:
+/// `schema.sql` has no `redemptions` table, so only the computed totals are
+/// returned.
+///
+/// # Status codes
+///
+/// * `200` with [`RedeemPointsResponse`] on success.
+/// * `400` for empty/invalid items.
+/// * `404` for an unknown client.
+/// * `409` for insufficient points.
+/// * `422` for a product that is not redeemable.
+/// * `500` on DB failures.
 #[tracing::instrument(skip(state, request), fields(client_id, items = request.items.len()))]
 pub async fn redeem_points(
     State(state): State<Arc<AppState>>,

@@ -23,9 +23,13 @@ use chrono::{DateTime, Utc};
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct Partners {
+    /// `partners.id` primary key.
     pub id: i32,
+    /// `partners.name` display name (`varchar(32)`).
     pub name: String,
+    /// `partners.ruc` tax id (`varchar(32)`), the login natural key.
     pub ruc: String,
+    /// `partners.is_active`; inactive partners cannot log in or bill.
     pub is_active: bool,
 }
 
@@ -47,10 +51,15 @@ pub struct Partners {
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct Clients {
+    /// `clients.id` primary key.
     pub id: i32,
+    /// `clients.ci` national id, unique and `>= 0`; identifies the client alone.
     pub ci: i32,
+    /// Optional `<ci>-<digit>` RUC suffix digit (`0-9`); never required.
     pub verification_digit: Option<i32>,
+    /// `clients.first_name` (`varchar(32)`).
     pub first_name: String,
+    /// `clients.last_name` (`varchar(32)`).
     pub last_name: String,
 }
 
@@ -67,8 +76,11 @@ pub struct Clients {
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct Products {
+    /// `products.id` primary key.
     pub id: i32,
+    /// `products.name` (`varchar(64)`).
     pub name: String,
+    /// `products.description` (`varchar(128)`, defaults to `'N/A'`).
     pub description: String,
 }
 
@@ -85,8 +97,11 @@ pub struct Products {
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct PromotionProducts {
+    /// `promotion_products.id` primary key.
     pub id: i32,
+    /// `products.id` whose purchase earns points.
     pub product_id: i32,
+    /// Points awarded per purchased unit (`>= 1`).
     pub points_cost: i32,
 }
 
@@ -103,8 +118,11 @@ pub struct PromotionProducts {
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct RedeemableProducts {
+    /// `redeemable_products.id` primary key.
     pub id: i32,
+    /// `products.id` that can be exchanged for points.
     pub product_id: i32,
+    /// Points charged per redeemed unit (`>= 1`).
     pub points_needed: i32,
 }
 
@@ -122,9 +140,13 @@ pub struct RedeemableProducts {
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct Tickets {
+    /// `tickets.id` primary key.
     pub id: i32,
+    /// `tickets.date` issue timestamp (defaults to `current_timestamp`).
     pub date: DateTime<Utc>,
+    /// `partners.id` of the issuing pharmacy.
     pub partner_id: i32,
+    /// `clients.id` of the buyer.
     pub client_id: i32,
 }
 
@@ -143,9 +165,13 @@ pub struct Tickets {
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct TicketDetails {
+    /// `ticket_details.id` primary key.
     pub id: i32,
+    /// Owning `tickets.id` (cascades on delete; unique per `product_id`).
     pub ticket_id: i32,
+    /// Purchased `products.id`.
     pub product_id: i32,
+    /// Units purchased (`quantity >= 1`).
     pub quantity: i32,
 }
 
@@ -162,7 +188,10 @@ pub struct TicketDetails {
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct PointEarnings {
+    /// `point_earnings.id` primary key.
     pub id: i32,
+    /// Awarded `tickets.id` (unique; cascades on delete).
     pub ticket_id: i32,
+    /// Awarded snapshot (`earned_points >= 1`).
     pub earned_points: i32,
 }
