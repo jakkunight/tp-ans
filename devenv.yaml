@@ -7,7 +7,7 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
-# secretspec:
-#   enable: true
-#   profile: default
-#   provider: sops
+secretspec:
+  enable: true
+  profile: development
+  provider: sops

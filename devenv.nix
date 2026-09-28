@@ -48,25 +48,25 @@
 
   # https://devenv.sh/processes/
   # processes.dev.exec = "${lib.getExe pkgs.watchexec} -n -- ls -la";
-  process.manager.implementation = "mprocs";
+  process.manager.implementation = "process-compose";
 
   processes = {
-    dev-lab = {
-      cwd = "${config.devenv.root}/lab";
-      exec = ''
-        export SOPS_AGE_KEY=~/.config/sops/age/dev-key.txt; secretspec run -- export DATABASE_URL="${
-          config.secretspec.secrets.LAB_DB_URL or ""
-        }" && cargo run
-      '';
-    };
-    dev-farm = {
-      cwd = "${config.devenv.root}/farm";
-      exec = ''
-        export SOPS_AGE_KEY=~/.config/sops/age/dev-key.txt; secretspec run -- export DATABASE_URL="${
-          config.secretspec.secrets.FARM_DB_URL or ""
-        }" && cargo run
-      '';
-    };
+    # dev-lab = {
+    #   cwd = "${config.devenv.root}/lab";
+    #   exec = ''
+    #     export SOPS_AGE_KEY=~/.config/sops/age/dev-key.txt; secretspec run -- export DATABASE_URL="${
+    #       config.secretspec.secrets.LAB_DB_URL or ""
+    #     }" && cargo run
+    #   '';
+    # };
+    # dev-farm = {
+    #   cwd = "${config.devenv.root}/farm";
+    #   exec = ''
+    #     export SOPS_AGE_KEY=~/.config/sops/age/dev-key.txt; secretspec run -- export DATABASE_URL="${
+    #       config.secretspec.secrets.FARM_DB_URL or ""
+    #     }" && cargo run
+    #   '';
+    # };
   };
 
   # https://devenv.sh/services/
@@ -76,17 +76,17 @@
       enable = true;
       initialDatabases = [
         {
-          name = config.secretspec.secrets.LAB_DB_DATABASE or "";
-          schema = ./lab/database/schema.sql;
-          user = config.secretspec.secrets.LAB_DB_USER or "";
-          pass = config.secretspec.secrets.LAB_DB_PASS or "";
+          name = config.secretspec.secrets.LAB_DB_DATABASE or "lab";
+          schema = /home/jakku/Documents/COLUMBIA/ans/sistema-tickets/lab/database/schema.sql;
+          user = config.secretspec.secrets.LAB_DB_USER or "lab";
+          pass = config.secretspec.secrets.LAB_DB_PASS or "lab";
         }
-        {
-          name = config.secretspec.secrets.FARM_DB_DATABASE or "";
-          schema = null;
-          user = config.secretspec.secrets.FARM_DB_USER or "";
-          pass = config.secretspec.secrets.FARM_DB_PASS or "";
-        }
+        # {
+        #   name = config.secretspec.secrets.FARM_DB_DATABASE or "";
+        #   schema = null;
+        #   user = config.secretspec.secrets.FARM_DB_USER or "";
+        #   pass = config.secretspec.secrets.FARM_DB_PASS or "";
+        # }
       ];
       listen_addresses = "127.0.0.1";
       port = 5432;

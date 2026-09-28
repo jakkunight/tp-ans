@@ -1,7 +1,5 @@
-use std::{env, sync::Arc};
-
 use axum::{
-    extract::{Request, State},
+    extract::Request,
     http::{StatusCode, header},
     middleware::Next,
     response::Response,
@@ -10,268 +8,182 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
-
-// ============================================================
-// Partner Claims
-// ============================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PartnerClaims {
-    /// Partner's unique identifier (matches `partners.id`).
-    sub: i64,
-    /// Partner's name (matches `partners.name`).
-    name: String,
-    /// Partner's RUC / tax ID (matches `partners.ruc`).
-    ruc: String,
-    /// Issued at (Unix timestamp).
-    iat: i64,
-    /// Expiration (Unix timestamp).
-    exp: i64,
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PartnerClaims {
+    partner_id: String,
+    partner_secret: String,
+    expires: Option<DateTime<Utc>>,
 }
 
-// ============================================================
-// Customer Claims
-// ============================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CustomerClaims {
-    /// Customer's unique identifier (matches `clients.id`).
-    sub: i64,
-    /// Customer's CI / ID number (matches `clients.ci`).
-    ci: i32,
-    /// Customer's first name (matches `clients.first_name`).
-    first_name: String,
-    /// Customer's last name (matches `clients.last_name`).
-    last_name: String,
-    /// Optional verification digit (matches `clients.verification_digit`).
-    verification_digit: Option<i32>,
-    /// Issued at (Unix timestamp).
-    iat: i64,
-    /// Expiration (Unix timestamp).
-    exp: i64,
+impl TryFrom<Claims> for PartnerClaims {
+    type Error = anyhow::Error;
+    fn try_from(value: Claims) -> Result<Self, Self::Error> {
+        match value {
+            Claims::Partner(p) => Ok(p),
+            _ => anyhow::bail!("Invalid claim format"),
+        }
+    }
 }
 
-// ============================================================
-// Generic Claims (backward compatibility)
-// ============================================================
+impl PartnerClaims {
+    pub fn new(partner_id: String, partner_secret: String, expires: Option<DateTime<Utc>>) -> Self {
+        Self {
+            partner_id,
+            partner_secret,
+            expires,
+        }
+    }
+}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Claims {
-    subject: String,
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ClientClaims {
+    client_id: String,
+    client_ci: String,
     expires: DateTime<Utc>,
 }
 
-// ============================================================
-// Token Creation Helpers
-// ============================================================
-
-pub fn create_token(subject: &str) -> anyhow::Result<JwtToken> {
-    let claims = Claims {
-        subject: subject.to_string(),
-        expires: Utc::now() + chrono::Duration::days(30),
-    };
-
-    let secret =
-        env::var("LAB_JWT_SECRET").map_err(|_| anyhow::anyhow!("LAB_JWT_SECRET not set"))?;
-
-    let jwt_string = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )?;
-
-    Ok(JwtToken(jwt_string))
+impl TryFrom<Claims> for ClientClaims {
+    type Error = anyhow::Error;
+    fn try_from(value: Claims) -> Result<Self, Self::Error> {
+        match value {
+            Claims::Client(c) => Ok(c),
+            _ => anyhow::bail!("Invalid claim format"),
+        }
+    }
 }
 
-pub struct JwtToken(String);
-
-// ============================================================
-// Partner Token Helpers
-// ============================================================
-
-/// Creates a JWT access token for a partner.
-///
-/// The token is valid for 30 days and contains the partner's ID, name,
-/// and RUC. Use `verify_partner_token` to validate and decode it.
-pub fn create_partner_token(
-    partner_id: i64,
-    partner_name: &str,
-    partner_ruc: &str,
-) -> anyhow::Result<JwtToken> {
-    let now = Utc::now();
-    let expires = now + chrono::Duration::days(30);
-    let iat = now.timestamp();
-    let exp = expires.timestamp();
-
-    let claims = PartnerClaims {
-        sub: partner_id,
-        name: partner_name.to_string(),
-        ruc: partner_ruc.to_string(),
-        iat,
-        exp,
-    };
-
-    let secret =
-        env::var("LAB_JWT_SECRET").map_err(|_| anyhow::anyhow!("LAB_JWT_SECRET not set"))?;
-
-    let jwt_string = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )?;
-
-    Ok(JwtToken(jwt_string))
+impl ClientClaims {
+    pub fn new(client_id: String, client_ci: String, expires: DateTime<Utc>) -> Self {
+        Self {
+            client_id,
+            client_ci,
+            expires,
+        }
+    }
 }
 
-// ============================================================
-// Customer Token Helpers
-// ============================================================
-
-/// Creates a JWT access token for a customer.
-///
-/// The token is valid for 30 days and contains the customer's ID, CI,
-/// names, and optional verification digit. Use
-/// `verify_customer_token` to validate and decode it.
-pub fn create_customer_token(
-    customer_id: i64,
-    ci: i32,
-    first_name: &str,
-    last_name: &str,
-    verification_digit: Option<i32>,
-) -> anyhow::Result<JwtToken> {
-    let now = Utc::now();
-    let expires = now + chrono::Duration::days(30);
-    let iat = now.timestamp();
-    let exp = expires.timestamp();
-
-    let claims = CustomerClaims {
-        sub: customer_id,
-        ci,
-        first_name: first_name.to_string(),
-        last_name: last_name.to_string(),
-        verification_digit,
-        iat,
-        exp,
-    };
-
-    let secret =
-        env::var("LAB_JWT_SECRET").map_err(|_| anyhow::anyhow!("LAB_JWT_SECRET not set"))?;
-
-    let jwt_string = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )?;
-
-    Ok(JwtToken(jwt_string))
+#[derive(Clone, Serialize, Deserialize)]
+pub enum Claims {
+    Partner(PartnerClaims),
+    Client(ClientClaims),
 }
 
-// ============================================================
-// Token Verification Helpers
-// ============================================================
-
-/// Verifies and decodes a partner JWT token.
-///
-/// Validates the token signature using `LAB_JWT_SECRET`, checks
-/// expiration with a 1-hour leeway, and returns the partner claims.
-/// Panics if the token is invalid, expired, or malformed.
-pub fn verify_partner_token(token: &str) -> anyhow::Result<PartnerClaims> {
-    let secret =
-        env::var("LAB_JWT_SECRET").map_err(|_| anyhow::anyhow!("LAB_JWT_SECRET not set"))?;
-
-    let mut validation = Validation::default();
-    validation = validation.with_leeway(chrono::Duration::hours(1));
-
-    let data = decode(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )?;
-
-    Ok(data.claims)
+impl From<ClientClaims> for Claims {
+    fn from(value: ClientClaims) -> Self {
+        Self::Client(value)
+    }
 }
 
-/// Verifies and decodes a customer JWT token.
-///
-/// Validates the token signature using `LAB_JWT_SECRET`, checks
-/// expiration with a 1-hour leeway, and returns the customer claims.
-/// Panics if the token is invalid, expired, or malformed.
-pub fn verify_customer_token(token: &str) -> anyhow::Result<CustomerClaims> {
-    let secret =
-        env::var("LAB_JWT_SECRET").map_err(|_| anyhow::anyhow!("LAB_JWT_SECRET not set"))?;
-
-    let mut validation = Validation::default();
-    validation = validation.with_leeway(chrono::Duration::hours(1));
-
-    let data = decode(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )?;
-
-    Ok(data.claims)
+impl From<PartnerClaims> for Claims {
+    fn from(value: PartnerClaims) -> Self {
+        Self::Partner(value)
+    }
 }
 
-// ============================================================
-// Generic Token Validation (for backward compatibility)
-// ============================================================
+pub fn create_token(claims: Claims) -> anyhow::Result<String> {
+    match claims {
+        Claims::Partner(p) => {
+            let secret = match std::env::var("LAB_JWT_SECRET") {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("{e:?}");
+                    anyhow::bail!(e)
+                }
+            };
+            match encode(
+                &Header::default(),
+                &p,
+                &EncodingKey::from_secret(&secret.into_bytes()),
+            ) {
+                Ok(t) => {
+                    tracing::info!("Token created");
+                    return Ok(t);
+                }
+                Err(_) => {
+                    tracing::error!("Failed to create token");
+                    anyhow::bail!("Failed to create token")
+                }
+            }
+        }
+        Claims::Client(c) => {
+            let secret = match std::env::var("LAB_JWT_SECRET") {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("{e:?}");
+                    anyhow::bail!(e)
+                }
+            };
+            match encode(
+                &Header::default(),
+                &c,
+                &EncodingKey::from_secret(&secret.into_bytes()),
+            ) {
+                Ok(t) => {
+                    tracing::info!("Token created");
+                    return Ok(t);
+                }
+                Err(_) => {
+                    tracing::error!("Failed to create token");
+                    anyhow::bail!("Failed to create token")
+                }
+            }
+        }
+    }
+}
 
-async fn validate_token(token: &str) -> anyhow::Result<Claims> {
-    let secret = match env::var("LAB_JWT_SECRET") {
+pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
+    let secret = match std::env::var("LAB_JWT_SECRET") {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("Failed to get the secrets from the environment.");
-            tracing::error!("Chacke the setup and try the request again.");
-            anyhow::bail!(StatusCode::INTERNAL_SERVER_ERROR);
+            tracing::error!("{e:?}");
+            anyhow::bail!(e)
         }
     };
-    let data = match decode(
+    match decode(
         token,
-        &DecodingKey::from_secret(secret.as_bytes()),
+        &DecodingKey::from_secret(&secret.into_bytes()),
         &Validation::default(),
     ) {
-        Ok(d) => d,
-        Err(_) => {
-            tracing::error!("Failed to decode the JWT.");
-            tracing::warn!("Did the token expire?");
-            anyhow::bail!(StatusCode::UNAUTHORIZED);
+        Ok(d) => {
+            return Ok(d.claims);
         }
-    };
-
-    Ok(data.claims)
+        Err(e) => {
+            tracing::error!("Failed to decode the token");
+            tracing::error!("{e:?}");
+            anyhow::bail!("Failed to decode the token")
+        }
+    }
 }
 
-// ============================================================
-// JWT Middleware
-// ============================================================
-
-/// Middleware for protecting routes that require JWT authentication.
-///
-/// Expects a `Bearer` token in the `Authorization` header. Decodes the
-/// token using the generic `Claims` type and attaches it to the request
-/// for downstream handlers. Use `axum::middleware::from_fn_with_state`
-/// to attach this to a router.
-pub async fn jwt_auth_middleware(
-    mut req: Request,
-    _state: State<Arc<AppState>>,
-    next: Next,
-) -> Result<Response, StatusCode> {
+pub async fn jwt_middleware(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+    // 1. Get the Authorization header
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|value| value.to_str().ok());
 
+    // 2. Make sure it starts with "Bearer "
     let token = match auth_header {
-        Some(h) if h.starts_with("Bearer ") => &h["Bearer ".len()..],
-        _ => return Err(StatusCode::UNAUTHORIZED),
+        Some(header) if header.starts_with("Bearer ") => {
+            &header["Bearer ".len()..] // slice off "Bearer " prefix
+        }
+        _ => {
+            // No token or wrong format — reject with 401
+            return Err(StatusCode::UNAUTHORIZED);
+        }
     };
 
-    match validate_token(token).await {
+    // 3. Validate the token
+    match validate_token(token) {
         Ok(claims) => {
+            // 4. Attach the claims to the request so handlers can use them
             req.extensions_mut().insert(claims);
+            // 5. Pass the request to the next layer (your handler)
             Ok(next.run(req).await)
         }
-        Err(_) => Err(StatusCode::UNAUTHORIZED),
+        Err(_) => {
+            // Invalid or expired token — reject with 401
+            Err(StatusCode::UNAUTHORIZED)
+        }
     }
 }
