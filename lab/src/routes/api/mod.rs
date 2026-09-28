@@ -6,6 +6,13 @@
 //! JWTs via [`crate::jwt`]. Traces carry numeric ids/counts only —
 //! credentials (CI, names, RUC, secrets) and tokens are never logged.
 //!
+//! Failures share one shape: [`ApiError`], i.e. the HTTP status plus a JSON
+//! [`dto::ErrorResponse`] body (see each handler's docs for
+//! the codes it can produce).
+//!
+//! The login routes are public; every other route requires a bearer JWT
+//! enforced by [`crate::jwt::jwt_middleware`].
+//!
 //! | Method & path | Handler | Auth |
 //! |---|---|---|
 //! | `POST /api/v1/partners/login` | [`partner_login`] | public |
@@ -23,19 +30,23 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
+    middleware,
     routing::{delete, get, post},
 };
 use chrono::{Duration, Utc};
 
 use crate::{
     AppState,
-    jwt::{ClientClaims, PartnerClaims, create_token},
-    models::{Clients, Partners},
+    jwt::{ClientClaims, PartnerClaims, create_token, jwt_middleware},
+    models::{
+        Clients, Partners, PointEarnings, Products, PromotionProducts, RedeemableProducts,
+        TicketDetails, Tickets,
+    },
 };
 
 use self::dto::{
     ClientDataResponse, ClientInfoDto, ClientLoginRequest, CreateTicketRequest,
-    CreateTicketResponse, DeleteTicketRequest, DeleteTicketResponse, LoginResponse,
+    CreateTicketResponse, DeleteTicketRequest, DeleteTicketResponse, ErrorResponse, LoginResponse,
     PartnerLoginRequest, RedeemPointsRequest, RedeemPointsResponse, TicketDetailDto, TicketDto,
 };
 
@@ -45,8 +56,19 @@ pub mod dto;
 // non-sensitive fields (numeric DB ids, counts, point totals). Credentials
 // (CI, names, RUC, secrets) and JWT tokens are NEVER logged.
 
+/// Error shape returned by every REST handler: the HTTP status plus a JSON
+/// [`ErrorResponse`] body. Axum turns it into the response automatically.
+pub type ApiError = (StatusCode, Json<ErrorResponse>);
+
+/// Builds an [`ApiError`] from a status code and a machine-readable message
+/// (see each handler's docs for the codes it can produce).
+fn api_error(code: StatusCode, message: &str) -> ApiError {
+    (code, Json(ErrorResponse::new(message)))
+}
+
 /// Builds the `/api/v1/...` router: two public login routes plus the
-/// ticket/client routes (intended to sit behind [`jwt_middleware`](crate::jwt::jwt_middleware)).
+/// ticket/client routes, which require a bearer JWT via
+/// [`crate::jwt::jwt_middleware`].
 ///
 /// # Errors
 ///
@@ -62,7 +84,8 @@ pub fn create_api() -> anyhow::Result<Router<Arc<AppState>>> {
         .route(
             "/api/v1/clients/{client_id}/redeem_points",
             post(redeem_points),
-        );
+        )
+        .route_layer(middleware::from_fn(jwt_middleware));
     let router = Router::new().merge(public_api).merge(private_api);
     Ok(router)
 }
@@ -82,7 +105,7 @@ pub fn create_api() -> anyhow::Result<Router<Arc<AppState>>> {
 pub async fn client_login(
     State(state): State<Arc<AppState>>,
     Json(credentials): Json<ClientLoginRequest>,
-) -> Result<Json<LoginResponse>, StatusCode> {
+) -> Result<Json<LoginResponse>, ApiError> {
     // Clients are uniquely identified by `ci` alone. The verification digit
     // (`<ci>-<digit>` RUC suffix) is government-issued optional data: it is
     // neither required for login nor for ticket generation, so only
@@ -98,11 +121,11 @@ pub async fn client_login(
     .await
     .map_err(|e| {
         tracing::error!("client_login: db error: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?
     .ok_or_else(|| {
         tracing::warn!("client_login: rejected (unknown credentials)");
-        StatusCode::UNAUTHORIZED
+        api_error(StatusCode::UNAUTHORIZED, "unknown credentials")
     })?;
 
     let claims = ClientClaims::new(
@@ -112,7 +135,7 @@ pub async fn client_login(
     );
     let token = create_token(claims.into()).map_err(|e| {
         tracing::error!("client_login: token error: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "token error")
     })?;
     tracing::info!(client_id = client.id, "client_login: succeeded");
     Ok(Json(LoginResponse::bearer(token)))
@@ -134,7 +157,7 @@ pub async fn client_login(
 pub async fn partner_login(
     State(state): State<Arc<AppState>>,
     Json(credentials): Json<PartnerLoginRequest>,
-) -> Result<Json<LoginResponse>, StatusCode> {
+) -> Result<Json<LoginResponse>, ApiError> {
     tracing::debug!("partner login attempt");
     let partner: Partners = sqlx::query_as::<_, Partners>(
         "SELECT id, name, ruc, is_active FROM partners WHERE ruc = $1",
@@ -144,11 +167,11 @@ pub async fn partner_login(
     .await
     .map_err(|e| {
         tracing::error!("partner_login: db error: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?
     .ok_or_else(|| {
         tracing::warn!("partner_login: rejected (unknown credentials)");
-        StatusCode::UNAUTHORIZED
+        api_error(StatusCode::UNAUTHORIZED, "unknown credentials")
     })?;
 
     if !partner.is_active {
@@ -156,14 +179,14 @@ pub async fn partner_login(
             partner_id = partner.id,
             "partner_login: rejected (inactive partner)"
         );
-        return Err(StatusCode::FORBIDDEN);
+        return Err(api_error(StatusCode::FORBIDDEN, "inactive partner"));
     }
 
     let secret = credentials.secret.unwrap_or_default();
     let claims = PartnerClaims::new(partner.id.to_string(), secret, None);
     let token = create_token(claims.into()).map_err(|e| {
         tracing::error!("partner_login: token error: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "token error")
     })?;
     tracing::info!(partner_id = partner.id, "partner_login: succeeded");
     Ok(Json(LoginResponse::bearer(token)))
@@ -196,7 +219,7 @@ pub async fn partner_login(
 pub async fn add_ticket(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateTicketRequest>,
-) -> Result<Json<CreateTicketResponse>, StatusCode> {
+) -> Result<Json<CreateTicketResponse>, ApiError> {
     // 0. Validate the buyer data from the ticket (also used to register him)
     // 1. Register the client from the ticket data (find-or-create by CI)
     // 2. Insert the new ticket into the DB
@@ -205,12 +228,12 @@ pub async fn add_ticket(
     tracing::debug!("add_ticket: request received");
     if request.details.is_empty() {
         tracing::warn!("add_ticket: rejected (empty details)");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(api_error(StatusCode::BAD_REQUEST, "empty details"));
     }
     for d in &request.details {
         if d.quantity < 1 || d.product_id < 1 {
             tracing::warn!("add_ticket: rejected (invalid line quantity/product id)");
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(api_error(StatusCode::BAD_REQUEST, "empty details"));
         }
     }
     // Buyer identity comes from the factura itself: `ci` is unique and
@@ -218,22 +241,22 @@ pub async fn add_ticket(
     // (Values are not logged: CI and names are sensitive.)
     if request.client.ci < 0 {
         tracing::warn!("add_ticket: rejected (invalid buyer ci)");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(api_error(StatusCode::BAD_REQUEST, "invalid buyer ci"));
     }
     let first_name = request.client.first_name.trim();
     let last_name = request.client.last_name.trim();
     if first_name.is_empty() || last_name.is_empty() {
         tracing::warn!("add_ticket: rejected (missing buyer name)");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(api_error(StatusCode::BAD_REQUEST, "missing buyer name"));
     }
     if first_name.len() > 32 || last_name.len() > 32 {
         tracing::warn!("add_ticket: rejected (buyer name too long)");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(api_error(StatusCode::BAD_REQUEST, "missing buyer name"));
     }
     if let Some(vd) = request.client.verification_digit {
         if !(0..=9).contains(&vd) {
             tracing::warn!("add_ticket: rejected (invalid verification digit)");
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(api_error(StatusCode::BAD_REQUEST, "buyer name too long"));
         }
     }
 
@@ -245,54 +268,74 @@ pub async fn add_ticket(
     .await
     .map_err(|e| {
         tracing::error!("add_ticket: partner lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?
     .ok_or_else(|| {
         tracing::warn!(
             partner_id = request.partner_id,
             "add_ticket: partner not found"
         );
-        StatusCode::NOT_FOUND
+        api_error(StatusCode::NOT_FOUND, "partner not found")
     })?;
     if !partner.is_active {
         tracing::warn!(
             partner_id = partner.id,
             "add_ticket: rejected (inactive partner)"
         );
-        return Err(StatusCode::FORBIDDEN);
+        return Err(api_error(StatusCode::FORBIDDEN, "inactive partner"));
     }
 
     let product_ids: Vec<i32> = request.details.iter().map(|d| d.product_id).collect();
-    let found_ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM products WHERE id = ANY($1)")
-        .bind(&product_ids)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| {
-            tracing::error!("add_ticket: product lookup failed: {e:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let found: HashSet<i32> = found_ids.into_iter().collect();
+    let found: HashSet<i32> = sqlx::query_as::<_, Products>(
+        "SELECT id, name, description FROM products WHERE id = ANY($1)",
+    )
+    .bind(&product_ids)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("add_ticket: product lookup failed: {e:?}");
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+    })?
+    .into_iter()
+    .map(|p| p.id)
+    .collect();
     if request
         .details
         .iter()
         .any(|d| !found.contains(&d.product_id))
     {
+        let missing: Vec<String> = request
+            .details
+            .iter()
+            .map(|d| d.product_id)
+            .filter(|id| !found.contains(id))
+            .map(|id| id.to_string())
+            .collect();
         tracing::warn!("add_ticket: rejected (unknown product id in details)");
-        return Err(StatusCode::NOT_FOUND);
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::with_message(
+                "unknown product",
+                format!("unknown product ids: {}", missing.join(", ")),
+            )),
+        ));
     }
 
     // Points earned per unit come from `promotion_products.points_cost`.
-    let promo_rows: Vec<(i32, i32)> = sqlx::query_as(
-        "SELECT product_id, points_cost FROM promotion_products WHERE product_id = ANY($1)",
+    let promo_rows: Vec<PromotionProducts> = sqlx::query_as(
+        "SELECT id, product_id, points_cost FROM promotion_products WHERE product_id = ANY($1)",
     )
     .bind(&product_ids)
     .fetch_all(&state.db)
     .await
     .map_err(|e| {
         tracing::error!("add_ticket: promotion lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
-    let promo: HashMap<i32, i32> = promo_rows.into_iter().collect();
+    let promo: HashMap<i32, i32> = promo_rows
+        .into_iter()
+        .map(|p| (p.product_id, p.points_cost))
+        .collect();
     let earned_points: i64 = request
         .details
         .iter()
@@ -300,11 +343,11 @@ pub async fn add_ticket(
         .sum();
     let earned_points: i32 = earned_points
         .try_into()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "points overflow"))?;
 
     let mut tx = state.db.begin().await.map_err(|e| {
         tracing::error!("add_ticket: begin failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
 
     // Register the buyer from the ticket data: reuse the client matching
@@ -316,7 +359,7 @@ pub async fn add_ticket(
         .await
         .map_err(|e| {
             tracing::error!("add_ticket: client lookup failed: {e:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
         })?;
     let (client_id, client_created) = match preexisting {
         Some(id) => (id, false),
@@ -333,7 +376,7 @@ pub async fn add_ticket(
             .await
             .map_err(|e| {
                 tracing::error!("add_ticket: client insert failed: {e:?}");
-                StatusCode::INTERNAL_SERVER_ERROR
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
             })?;
             let id: i32 = sqlx::query_scalar("SELECT id FROM clients WHERE ci = $1")
                 .bind(request.client.ci)
@@ -341,7 +384,7 @@ pub async fn add_ticket(
                 .await
                 .map_err(|e| {
                     tracing::error!("add_ticket: client lookup failed: {e:?}");
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
                 })?;
             (id, true)
         }
@@ -362,7 +405,7 @@ pub async fn add_ticket(
     .await
     .map_err(|e| {
         tracing::error!("add_ticket: insert ticket failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
 
     for d in &request.details {
@@ -376,7 +419,7 @@ pub async fn add_ticket(
         .await
         .map_err(|e| {
             tracing::error!("add_ticket: insert detail failed: {e:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
         })?;
     }
 
@@ -388,13 +431,13 @@ pub async fn add_ticket(
             .await
             .map_err(|e| {
                 tracing::error!("add_ticket: insert earnings failed: {e:?}");
-                StatusCode::INTERNAL_SERVER_ERROR
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
             })?;
     }
 
     tx.commit().await.map_err(|e| {
         tracing::error!("add_ticket: commit failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
 
     let earned = if earned_points >= 1 { earned_points } else { 0 };
@@ -425,7 +468,7 @@ pub async fn add_ticket(
 pub async fn delete_ticket(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteTicketRequest>,
-) -> Result<Json<DeleteTicketResponse>, StatusCode> {
+) -> Result<Json<DeleteTicketResponse>, ApiError> {
     // 1. Delete the inserted ticket
     // 2. Delete the associated point exchanges (DB should do this automaticaly
     //    via `ON DELETE CASCADE` on `ticket_details` and `point_earnings`)
@@ -437,7 +480,7 @@ pub async fn delete_ticket(
             .await
             .map_err(|e| {
                 tracing::error!("delete_ticket: delete failed: {e:?}");
-                StatusCode::INTERNAL_SERVER_ERROR
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
             })?;
 
     match deleted_id {
@@ -450,7 +493,7 @@ pub async fn delete_ticket(
         }
         None => {
             tracing::warn!("delete_ticket: ticket not found");
-            Err(StatusCode::NOT_FOUND)
+            Err(api_error(StatusCode::NOT_FOUND, "ticket not found"))
         }
     }
 }
@@ -461,9 +504,10 @@ pub async fn delete_ticket(
 ///
 /// # Errors
 ///
-/// Returns [`StatusCode::INTERNAL_SERVER_ERROR`] when the `SUM` query fails.
+/// Returns an [`ApiError`] with [`StatusCode::INTERNAL_SERVER_ERROR`] when
+/// the `SUM` query fails.
 #[tracing::instrument(skip(db), fields(client_id))]
-async fn total_earned_points(db: &sqlx::PgPool, client_id: i32) -> Result<i32, StatusCode> {
+async fn total_earned_points(db: &sqlx::PgPool, client_id: i32) -> Result<i32, ApiError> {
     let total: Option<i64> = sqlx::query_scalar(
         "SELECT COALESCE(SUM(pe.earned_points), 0) FROM point_earnings pe
          JOIN tickets t ON t.id = pe.ticket_id WHERE t.client_id = $1",
@@ -473,7 +517,7 @@ async fn total_earned_points(db: &sqlx::PgPool, client_id: i32) -> Result<i32, S
     .await
     .map_err(|e| {
         tracing::error!("points total lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
     Ok(total.unwrap_or(0).try_into().unwrap_or(i32::MAX))
 }
@@ -494,7 +538,7 @@ async fn total_earned_points(db: &sqlx::PgPool, client_id: i32) -> Result<i32, S
 pub async fn get_client_data(
     State(state): State<Arc<AppState>>,
     Path(client_id): Path<i32>,
-) -> Result<Json<ClientDataResponse>, StatusCode> {
+) -> Result<Json<ClientDataResponse>, ApiError> {
     // NOTE:
     // This function should get all the data needed for the user to make the point redemtion dashboard.
     tracing::debug!("get_client_data: request received");
@@ -506,14 +550,14 @@ pub async fn get_client_data(
     .await
     .map_err(|e| {
         tracing::error!("get_client_data: client lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?
     .ok_or_else(|| {
         tracing::warn!("get_client_data: client not found");
-        StatusCode::NOT_FOUND
+        api_error(StatusCode::NOT_FOUND, "client not found")
     })?;
 
-    let ticket_rows: Vec<(i32, chrono::DateTime<Utc>, i32, i32)> = sqlx::query_as(
+    let ticket_rows: Vec<Tickets> = sqlx::query_as(
         "SELECT id, date, partner_id, client_id FROM tickets WHERE client_id = $1 ORDER BY date ASC, id ASC",
     )
     .bind(client_id)
@@ -521,43 +565,44 @@ pub async fn get_client_data(
     .await
     .map_err(|e| {
         tracing::error!("get_client_data: tickets lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
 
     let mut tickets = Vec::with_capacity(ticket_rows.len());
-    for (id, date, partner_id, ticket_client_id) in ticket_rows {
-        let detail_rows: Vec<(i32, i32)> = sqlx::query_as(
-            "SELECT product_id, quantity FROM ticket_details WHERE ticket_id = $1 ORDER BY product_id ASC",
+    for t in ticket_rows {
+        let detail_rows: Vec<TicketDetails> = sqlx::query_as(
+            "SELECT id, ticket_id, product_id, quantity FROM ticket_details WHERE ticket_id = $1 ORDER BY product_id ASC",
         )
-        .bind(id)
+        .bind(t.id)
         .fetch_all(&state.db)
         .await
         .map_err(|e| {
             tracing::error!("get_client_data: details lookup failed: {e:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
         })?;
-        let earned: Option<i32> =
-            sqlx::query_scalar("SELECT earned_points FROM point_earnings WHERE ticket_id = $1")
-                .bind(id)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| {
-                    tracing::error!("get_client_data: earnings lookup failed: {e:?}");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+        let earned: Option<PointEarnings> = sqlx::query_as(
+            "SELECT id, ticket_id, earned_points FROM point_earnings WHERE ticket_id = $1",
+        )
+        .bind(t.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("get_client_data: earnings lookup failed: {e:?}");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        })?;
         tickets.push(TicketDto {
-            id,
-            date,
-            partner_id,
-            client_id: ticket_client_id,
+            id: t.id,
+            date: t.date,
+            partner_id: t.partner_id,
+            client_id: t.client_id,
             details: detail_rows
                 .into_iter()
-                .map(|(product_id, quantity)| TicketDetailDto {
-                    product_id,
-                    quantity,
+                .map(|d| TicketDetailDto {
+                    product_id: d.product_id,
+                    quantity: d.quantity,
                 })
                 .collect(),
-            earned_points: earned,
+            earned_points: earned.map(|pe| pe.earned_points),
         });
     }
 
@@ -609,7 +654,7 @@ pub async fn redeem_points(
     State(state): State<Arc<AppState>>,
     Path(client_id): Path<i32>,
     Json(request): Json<RedeemPointsRequest>,
-) -> Result<Json<RedeemPointsResponse>, StatusCode> {
+) -> Result<Json<RedeemPointsResponse>, ApiError> {
     // 1. Add a redemption generated by the user to the database.
     //    NOTE: `schema.sql` currently has no `redemptions` table, so the
     //    redemption is validated and priced against `redeemable_products`
@@ -617,12 +662,12 @@ pub async fn redeem_points(
     tracing::debug!("redeem_points: request received");
     if request.items.is_empty() {
         tracing::warn!("redeem_points: rejected (empty items)");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(api_error(StatusCode::BAD_REQUEST, "empty items"));
     }
     for item in &request.items {
         if item.quantity < 1 || item.product_id < 1 {
             tracing::warn!("redeem_points: rejected (invalid item quantity/product id)");
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(api_error(StatusCode::BAD_REQUEST, "empty items"));
         }
     }
 
@@ -632,25 +677,28 @@ pub async fn redeem_points(
         .await
         .map_err(|e| {
             tracing::error!("redeem_points: client lookup failed: {e:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
         })?;
     if exists.is_none() {
         tracing::warn!("redeem_points: client not found");
-        return Err(StatusCode::NOT_FOUND);
+        return Err(api_error(StatusCode::NOT_FOUND, "client not found"));
     }
 
     let product_ids: Vec<i32> = request.items.iter().map(|i| i.product_id).collect();
-    let price_rows: Vec<(i32, i32)> = sqlx::query_as(
-        "SELECT product_id, points_needed FROM redeemable_products WHERE product_id = ANY($1)",
+    let price_rows: Vec<RedeemableProducts> = sqlx::query_as(
+        "SELECT id, product_id, points_needed FROM redeemable_products WHERE product_id = ANY($1)",
     )
     .bind(&product_ids)
     .fetch_all(&state.db)
     .await
     .map_err(|e| {
         tracing::error!("redeem_points: redeemable lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
-    let prices: HashMap<i32, i32> = price_rows.into_iter().collect();
+    let prices: HashMap<i32, i32> = price_rows
+        .into_iter()
+        .map(|p| (p.product_id, p.points_needed))
+        .collect();
 
     let mut redeemed: i64 = 0;
     for item in &request.items {
@@ -659,11 +707,19 @@ pub async fn redeem_points(
                 product_id = item.product_id,
                 "redeem_points: rejected (product not redeemable)"
             );
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse::with_message(
+                    "product not redeemable",
+                    format!("product {} is not redeemable", item.product_id),
+                )),
+            ));
         };
         redeemed += *price as i64 * item.quantity as i64;
     }
-    let redeemed_points: i32 = redeemed.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let redeemed_points: i32 = redeemed
+        .try_into()
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "points overflow"))?;
 
     let total_earned = total_earned_points(&state.db, client_id).await?;
     // See note in `get_client_data`: no redemption history table exists yet.
@@ -674,7 +730,13 @@ pub async fn redeem_points(
             total_earned,
             "redeem_points: rejected (insufficient points)"
         );
-        return Err(StatusCode::CONFLICT);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::with_message(
+                "insufficient points",
+                format!("redeeming {redeemed_points} of {total_earned} earned"),
+            )),
+        ));
     }
 
     tracing::info!(

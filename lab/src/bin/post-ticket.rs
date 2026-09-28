@@ -151,7 +151,8 @@ Options:
   --item PID:QTY   One ticket line; repeatable. At least one required.
                    Example: --item 1:2 --item 3:1
   --base-url URL   API base URL. Default: $LAB_BASE_URL or http://127.0.0.1:8080
-  --token TOKEN    Bearer JWT. Default: $LAB_JWT_TOKEN or empty (API is open).
+  --token TOKEN    Bearer JWT for the ticket routes (required). Default:
+                   $LAB_JWT_TOKEN; use --login-partner to mint one.
   --delete ID      Void ticket ID instead of posting (DELETE /partners/tickets).
   --dry-run        Print the JSON body without sending it.
   --tui            Force the interactive Ratatui interface.
@@ -966,7 +967,7 @@ fn input_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
 /// On-screen titles of the fixed text fields, indexed by `FIELD_*`.
 const FIELD_TITLES: [&str; TEXT_FIELDS] = [
     "Base URL",
-    "JWT token (optional, filled by login)",
+    "JWT token (required, filled by login)",
     "Login RUC (partner)",
     "Login secret (optional)",
     "Partner ID",

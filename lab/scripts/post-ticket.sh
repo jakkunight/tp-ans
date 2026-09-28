@@ -14,6 +14,10 @@
 # The buyer is taken from the factura data and registered on the fly:
 # clients are looked up by CI (unique) and created when unknown.
 #
+# Ticket routes require a partner JWT: log in first and pass --token
+# (or $LAB_JWT_TOKEN). The Rust binary can do both in one call
+# (see lab/src/bin/post-ticket.rs --login-partner).
+#
 # Endpoint: POST /api/v1/partners/tickets
 #   Body: {"partner_id":1,"client":{"ci":1234567,"first_name":"María","last_name":"González"},"details":[{"product_id":1,"quantity":2}]}
 #   Reply: {"ticket_id":N,"client_id":M,"earned_points":K}
@@ -49,7 +53,8 @@ Options:
   --item PID:QTY   One ticket line; repeatable. At least one required.
                    Example: --item 1:2 --item 3:1
   --base-url URL   API base URL. Default: $LAB_BASE_URL or http://127.0.0.1:8080
-  --token TOKEN    Bearer JWT. Default: $LAB_JWT_TOKEN or empty (API is open).
+  --token TOKEN    Bearer JWT for the ticket routes (required).
+                   Default: $LAB_JWT_TOKEN.
   --delete ID      Void ticket ID instead of posting (DELETE /partners/tickets).
   --dry-run        Print the JSON body without sending it.
   -h, --help       Show this help plus the seed-data IDs.

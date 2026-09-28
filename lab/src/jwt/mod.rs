@@ -111,7 +111,11 @@ impl ClientClaims {
 
 /// Either actor that may hold a token: a [`Partner`](PartnerClaims) pharmacy
 /// or a [`Client`](ClientClaims) customer.
+///
+/// Deserialized `untagged` because [`create_token`] signs the bare inner
+/// claims object (e.g. `{"partner_id": ...}`), not an enveloped one.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum Claims {
     /// Claims minted for a partner via `POST /api/v1/partners/login`.
     Partner(PartnerClaims),
@@ -192,10 +196,15 @@ pub fn create_token(claims: Claims) -> anyhow::Result<String> {
 
 /// Verifies a compact JWT against `LAB_JWT_SECRET` and returns its [`Claims`].
 ///
+/// Our tokens carry expiry in the custom `expires` field rather than the
+/// standard `exp` claim, so stock `exp` validation is disabled and the
+/// custom field is enforced instead: expired client tokens (minted with +1h)
+/// and expired partner tokens are rejected.
+///
 /// # Errors
 ///
-/// Fails when `LAB_JWT_SECRET` is unset or when decoding/validation fails
-/// (bad signature, malformed token, …).
+/// Fails when `LAB_JWT_SECRET` is unset, when decoding/validation fails
+/// (bad signature, malformed token, …) or when the token has expired.
 pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
     let secret = match std::env::var("LAB_JWT_SECRET") {
         Ok(s) => s,
@@ -204,13 +213,25 @@ pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
             anyhow::bail!(e)
         }
     };
+    let mut validation = Validation::default();
+    validation.validate_exp = false;
+    validation.required_spec_claims.clear();
     match decode(
         token,
         &DecodingKey::from_secret(&secret.into_bytes()),
-        &Validation::default(),
+        &validation,
     ) {
         Ok(d) => {
-            return Ok(d.claims);
+            let claims: Claims = d.claims;
+            let expired = match &claims {
+                Claims::Client(c) => c.expires < Utc::now(),
+                Claims::Partner(p) => p.expires.is_some_and(|e| e < Utc::now()),
+            };
+            if expired {
+                tracing::warn!("validate_token: rejected (expired token)");
+                anyhow::bail!("Token expired")
+            }
+            return Ok(claims);
         }
         Err(e) => {
             tracing::error!("Failed to decode the token");
