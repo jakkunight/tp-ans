@@ -2,8 +2,8 @@
 //!
 //! All SQL lives here. Handlers in [`crate::routes::api`] only validate
 //! request shapes and map [`DbError`] to HTTP responses; every multi-statement
-//! write owns its transaction inside one of the functions below, so callers
-//! can never observe (or forget) a half-committed operation.
+//! operation owns its transaction inside one of the functions below, so
+//! callers can never observe (or forget) a half-committed operation.
 //!
 //! Balance accounting follows the schema notes: `point_ledger` is the single
 //! source of truth (`SUM(points_delta)` per client). Ticket awards post
@@ -11,6 +11,28 @@
 //! rows linked from `redemption_discounts`, and cancellations post negative
 //! compensating rows linked from `ticket_cancellation_discounts` — the
 //! original ticket rows are never deleted.
+//!
+//! ## Concurrency protocol
+//!
+//! Postgres runs these transactions at the default `READ COMMITTED` level.
+//! Check-then-act races are closed two ways:
+//!
+//! * **Pessimistic row locks** (`SELECT ... FOR UPDATE`): [`redeem_points`]
+//!   locks the client row before reading the balance, so concurrent
+//!   redemptions for the same client serialize and cannot overspend;
+//!   [`cancel_ticket`] locks the ticket row before the already-cancelled
+//!   check; [`create_ticket`] locks the partner row for the active check.
+//!   Locks are always taken in parent-before-child order
+//!   (partner/client → ticket → lines/ledger) and never held across
+//!   round-trips, so no deadlock cycle exists.
+//! * **Unique constraints as backstop**: the scoped invoice number
+//!   `(partner_id, ticket_id)`, the one-cancellation-per-ticket rule and
+//!   the find-or-create `ON CONFLICT (ci) DO NOTHING` turn any lock-window
+//!   leftover into a mapped `409`, never a 500 or a half-write.
+//!
+//! [`client_dashboard`] runs its multi-statement read inside a `READ ONLY`
+//! transaction so concurrent writers cannot tear the view (tickets listed
+//! without their details, totals from a different instant than the rows).
 use std::collections::{HashMap, HashSet};
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
@@ -350,8 +372,11 @@ pub struct CreatedTicket {
 pub async fn create_ticket(pool: &PgPool, ticket: NewTicket<'_>) -> Result<CreatedTicket, DbError> {
     let mut tx = pool.begin().await?;
 
+    // Lock the partner row first (parent-before-child lock order): the
+    // active check below stays true until this transaction commits, and
+    // concurrent writers on the partner serialize here instead of racing it.
     let partner: Option<Partners> = sqlx::query_as::<_, Partners>(
-        "SELECT id, name, ruc, psk_hash, is_active FROM partners WHERE id = $1",
+        "SELECT id, name, ruc, psk_hash, is_active FROM partners WHERE id = $1 FOR UPDATE",
     )
     .bind(ticket.partner_id)
     .fetch_optional(&mut *tx)
@@ -492,7 +517,11 @@ pub async fn create_ticket(pool: &PgPool, ticket: NewTicket<'_>) -> Result<Creat
 pub async fn cancel_ticket(pool: &PgPool, ticket_pk: i32, reason: &str) -> Result<i32, DbError> {
     let mut tx = pool.begin().await?;
 
-    let exists: Option<i32> = sqlx::query_scalar("SELECT id FROM tickets WHERE id = $1")
+    // Lock the ticket row (parent before children): concurrent cancels of
+    // the same ticket serialize here, so the already-cancelled check below
+    // cannot pass twice. The `ticket_cancellations.ticket_id` unique
+    // constraint remains as a backstop, mapped to `409`.
+    let exists: Option<i32> = sqlx::query_scalar("SELECT id FROM tickets WHERE id = $1 FOR UPDATE")
         .bind(ticket_pk)
         .fetch_optional(&mut *tx)
         .await?;
@@ -615,7 +644,12 @@ pub async fn redeem_points(
 ) -> Result<Redeemed, DbError> {
     let mut tx = pool.begin().await?;
 
-    let exists: Option<i32> = sqlx::query_scalar("SELECT id FROM clients WHERE id = $1")
+    // Lock the client row FIRST (parent before children): this serializes
+    // concurrent redemptions for the same client, so the balance read below
+    // cannot pass twice for the same points. Without this lock, two
+    // simultaneous requests could both see a sufficient balance and drive
+    // it negative.
+    let exists: Option<i32> = sqlx::query_scalar("SELECT id FROM clients WHERE id = $1 FOR UPDATE")
         .bind(client_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -750,28 +784,32 @@ struct Balance {
     cancelled: i32,
 }
 
-/// Sums ledger movements per event kind for a client.
-async fn balance_of(pool: &PgPool, client_id: i32) -> Result<Balance, DbError> {
+/// Sums ledger movements per event kind for a client, inside the caller's
+/// transaction (see [`client_dashboard`]).
+async fn balance_of(
+    tx: &mut Transaction<'_, Postgres>,
+    client_id: i32,
+) -> Result<Balance, DbError> {
     let earned: Option<i64> = sqlx::query_scalar(
         "SELECT COALESCE(SUM(pl.points_delta), 0) FROM ticket_earnings te
          JOIN point_ledger pl ON pl.id = te.point_ledger_id WHERE pl.client_id = $1",
     )
     .bind(client_id)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     let redeemed: Option<i64> = sqlx::query_scalar(
         "SELECT COALESCE(SUM(-pl.points_delta), 0) FROM redemption_discounts rd
          JOIN point_ledger pl ON pl.id = rd.point_ledger_id WHERE pl.client_id = $1",
     )
     .bind(client_id)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     let cancelled: Option<i64> = sqlx::query_scalar(
         "SELECT COALESCE(SUM(-pl.points_delta), 0) FROM ticket_cancellation_discounts cd
          JOIN point_ledger pl ON pl.id = cd.point_ledger_id WHERE pl.client_id = $1",
     )
     .bind(client_id)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     Ok(Balance {
         earned: earned.unwrap_or(0).try_into().unwrap_or(i32::MAX),
@@ -783,6 +821,10 @@ async fn balance_of(pool: &PgPool, client_id: i32) -> Result<Balance, DbError> {
 /// Serves the client points dashboard: profile, ledger-derived totals and
 /// full ticket history (voided invoices included, flagged).
 ///
+/// Reads run inside a `READ ONLY` transaction so the profile, ticket rows
+/// and totals all come from one snapshot, even while tickets, redemptions
+/// or cancellations commit concurrently.
+///
 /// # Errors
 ///
 /// Returns [`DbError::NotFound`] for unknown clients.
@@ -790,14 +832,30 @@ pub async fn client_dashboard(
     pool: &PgPool,
     client_id: i32,
 ) -> Result<ClientDataResponse, DbError> {
-    let client = client_by_id(pool, client_id).await?;
+    let mut tx = pool.begin().await?;
+    // Must precede the first statement: freezes the snapshot for every read
+    // below without taking any locks.
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+
+    let client: Clients = sqlx::query_as::<_, Clients>(
+        "SELECT id, ci, verification_digit, first_name, last_name, phone_number, email
+         FROM clients WHERE id = $1",
+    )
+    .bind(client_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(DbError::NotFound {
+        error: "client not found",
+    })?;
 
     let ticket_rows: Vec<Tickets> = sqlx::query_as::<_, Tickets>(
         "SELECT id, ticket_id, date, partner_id, client_id FROM tickets
          WHERE client_id = $1 ORDER BY date ASC, id ASC",
     )
     .bind(client_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let mut tickets = Vec::with_capacity(ticket_rows.len());
@@ -807,20 +865,20 @@ pub async fn client_dashboard(
              WHERE ticket_id = $1 ORDER BY product_id ASC",
         )
         .bind(t.id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
         let earned: Option<i64> = sqlx::query_scalar(
             "SELECT COALESCE(SUM(pl.points_delta), 0) FROM ticket_earnings te
              JOIN point_ledger pl ON pl.id = te.point_ledger_id WHERE te.ticket_id = $1",
         )
         .bind(t.id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
         let cancellation: Option<TicketCancellations> = sqlx::query_as::<_, TicketCancellations>(
             "SELECT id, ticket_id, date, reason FROM ticket_cancellations WHERE ticket_id = $1",
         )
         .bind(t.id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
         tickets.push(TicketDto {
             id: t.id,
@@ -841,7 +899,8 @@ pub async fn client_dashboard(
         });
     }
 
-    let balance = balance_of(pool, client_id).await?;
+    let balance = balance_of(&mut tx, client_id).await?;
+    tx.commit().await?;
     Ok(ClientDataResponse {
         client: ClientInfoDto {
             id: client.id,
