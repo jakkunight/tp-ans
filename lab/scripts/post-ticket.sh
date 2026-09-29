@@ -5,31 +5,36 @@
 # No jq needed.
 #
 # Usage:
-#   ./post-ticket.sh --partner 1 --ci 1234567 --first-name María --last-name González --item 1:2
-#   ./post-ticket.sh --partner 1 --ci 9990001 --first-name Ana --last-name López --item 2:3 --base-url http://127.0.0.1:8080
-#   ./post-ticket.sh --partner 1 --ci 1234567 --first-name María --last-name González --item 1:1 --token "$JWT" --dry-run
-#   ./post-ticket.sh --delete 5            # void ticket 5 (DELETE /partners/tickets)
+#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000002 --ci 1234567 --first-name María --last-name González --item 1:2
+#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000003 --ci 9990001 --first-name Ana --last-name López --phone +595983000001 --item 2:3 --base-url http://127.0.0.1:8080
+#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000004 --ci 1234567 --first-name María --last-name González --item 1:1 --token "$JWT" --dry-run
+#   ./post-ticket.sh --delete 5 --reason "factura duplicada"  # void ticket 5 (DELETE /partners/tickets)
 #   ./post-ticket.sh --help                # show IDs from lab/database/seed.sql
 #
 # The buyer is taken from the factura data and registered on the fly:
-# clients are looked up by CI (unique) and created when unknown.
+# clients are looked up by CI (unique) and created when unknown. New clients
+# need --phone and/or --email (the schema requires an OTP channel).
 #
-# Ticket routes require a partner JWT: log in first and pass --token
-# (or $LAB_JWT_TOKEN). The Rust binary can do both in one call
-# (see lab/src/bin/post-ticket.rs --login-partner).
+# Ticket routes require a partner JWT: log in first (RUC + pre-shared key)
+# and pass --token (or $LAB_JWT_TOKEN). The Rust binary can do both in one call
+# (see lab/src/bin/post-ticket.rs --login-partner --login-secret).
 #
 # Endpoint: POST /api/v1/partners/tickets
-#   Body: {"partner_id":1,"client":{"ci":1234567,"first_name":"María","last_name":"González"},"details":[{"product_id":1,"quantity":2}]}
+#   Body: {"partner_id":1,"ticket_id":"001-001-0000002","client":{"ci":1234567,"first_name":"María","last_name":"González"},"details":[{"product_id":1,"quantity":2}]}
 #   Reply: {"ticket_id":N,"client_id":M,"earned_points":K}
 set -u
 
 BASE_URL="${LAB_BASE_URL:-http://127.0.0.1:8080}"
 TOKEN="${LAB_JWT_TOKEN:-}"
 PARTNER=""
+TICKET_NO=""
 CI=""
 FIRST=""
 LAST=""
 VDIGIT=""
+PHONE=""
+EMAIL=""
+REASON=""
 DELETE_ID=""
 DRY_RUN=0
 ITEMS=()
@@ -39,31 +44,37 @@ usage() {
 post-ticket.sh — post tickets to the lab API from the terminal.
 
 Usage:
-  post-ticket.sh --partner ID --ci CI --first-name NAME --last-name NAME --item PID:QTY [...] [options]
-  post-ticket.sh --delete TICKET_ID [options]
+  post-ticket.sh --partner ID --ticket-id NRO --ci CI --first-name NAME --last-name NAME --item PID:QTY [...] [options]
+  post-ticket.sh --delete TICKET_ID --reason MOTIVO [options]
 
 Options:
   --partner ID     Partner (farmacia) id. Required unless --delete.
+  --ticket-id NRO  Invoice number from the factura (unique per partner). Required to post.
   --ci CI          Buyer CI from the factura (client is registered if new).
                    Required unless --delete.
   --first-name N   Buyer first name as printed on the factura. Required unless --delete.
   --last-name N    Buyer last name as printed on the factura. Required unless --delete.
   --verification-digit D
                    Optional <CI>-<D> RUC suffix digit (0-9).
+  --phone NUM      Buyer phone (SMS channel for OTP). New clients need --phone and/or --email.
+  --email ADDR     Buyer email (channel for OTP). New clients need --phone and/or --email.
   --item PID:QTY   One ticket line; repeatable. At least one required.
                    Example: --item 1:2 --item 3:1
   --base-url URL   API base URL. Default: $LAB_BASE_URL or http://127.0.0.1:8080
   --token TOKEN    Bearer JWT for the ticket routes (required).
                    Default: $LAB_JWT_TOKEN.
   --delete ID      Void ticket ID instead of posting (DELETE /partners/tickets).
+  --reason MOTIVO  Why the invoice is voided. Required with --delete.
   --dry-run        Print the JSON body without sending it.
   -h, --help       Show this help plus the seed-data IDs.
 
 Seed data (lab/database/seed.sql):
   Partners: 1 Farmacia Central (activa), 2 Farmacia del Sur (activa), 3 Inactiva
-  Clients:  1 María González (CI 1234567), 2 Juan Pérez (CI 2345678), 3 Ana López
-  Products: 1 Paracetamol (10 pts), 2 Ibuprofeno (8 pts), 3 Vitamina C (5 pts),
-            4 Crema (3 pts), 5 Termo (canje 100 pts), 6 Mochila (canje 250 pts)
+  Clients:  12 clientes (1 María González CI 1234567, 2 Juan Pérez CI 2345678, ...)
+  Products: 12 (1 Paracetamol 10 pts, 2 Ibuprofeno 8 pts, 3 Vitamina C 5 pts,
+            4 Crema 3 pts, 7 Alcohol 6 pts, 8 Jabón 4 pts, 9 Protector 12 pts;
+            canje: 5 Termo 100 pts, 6 Mochila 250 pts, 3 Vitamina 50 pts,
+            10 Termo Dep. 150 pts, 11 Gorra 80 pts, 12 Kit 300 pts)
 EOF
 }
 
@@ -72,10 +83,14 @@ die() { echo "error: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --partner) PARTNER="${2:-}"; shift 2 ;;
+    --ticket-id) TICKET_NO="${2:-}"; shift 2 ;;
     --ci) CI="${2:-}"; shift 2 ;;
     --first-name) FIRST="${2:-}"; shift 2 ;;
     --last-name) LAST="${2:-}"; shift 2 ;;
     --verification-digit) VDIGIT="${2:-}"; shift 2 ;;
+    --phone) PHONE="${2:-}"; shift 2 ;;
+    --email) EMAIL="${2:-}"; shift 2 ;;
+    --reason) REASON="${2:-}"; shift 2 ;;
     --item) ITEMS+=("${2:-}"); shift 2 ;;
     --base-url) BASE_URL="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
@@ -91,10 +106,11 @@ command -v python3 >/dev/null || die "python3 is required"
 
 BASE_URL="${BASE_URL%/}"
 
-# ---- DELETE mode: void a ticket ----
+# ---- DELETE mode: void a ticket (audit entry; rows stay intact) ----
 if [ -n "$DELETE_ID" ]; then
   [[ "$DELETE_ID" =~ ^[0-9]+$ ]] || die "--delete expects a numeric ticket id"
-  BODY="$(PARTNER="$DELETE_ID" python3 -c 'import json,os; print(json.dumps({"ticket_id": int(os.environ["PARTNER"])}))')"
+  [ -n "$REASON" ] || die "--reason is required with --delete"
+  BODY="$(TICKET="$DELETE_ID" REASON="$REASON" python3 -c 'import json,os; print(json.dumps({"ticket_id": int(os.environ["TICKET"]), "reason": os.environ["REASON"]}))')"
   [ "$DRY_RUN" -eq 1 ] && { echo "$BODY"; exit 0; }
   AUTH=(); [ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
   TMP="$(mktemp)"; CODE="$(curl -sS -o "$TMP" -w '%{http_code}' -X DELETE \
@@ -108,6 +124,7 @@ fi
 
 # ---- POST mode: validate ----
 [[ "$PARTNER" =~ ^[0-9]+$ ]] || die "--partner ID is required and must be numeric"
+[ -n "$TICKET_NO" ] || die "--ticket-id NRO is required (invoice number, unique per partner)"
 [[ "$CI" =~ ^[0-9]+$ ]] || die "--ci is required and must be numeric"
 [ -n "$FIRST" ] || die "--first-name is required"
 [ -n "$LAST" ] || die "--last-name is required"
@@ -120,7 +137,7 @@ for it in "${ITEMS[@]}"; do
 done
 
 # Build JSON body with python3 (no jq needed).
-BODY="$(PARTNER="$PARTNER" CI="$CI" FIRST="$FIRST" LAST="$LAST" VDIGIT="$VDIGIT" python3 - "$PARTNER" "${ITEMS[@]}" <<'PY'
+BODY="$(PARTNER="$PARTNER" TICKET_NO="$TICKET_NO" CI="$CI" FIRST="$FIRST" LAST="$LAST" VDIGIT="$VDIGIT" PHONE="$PHONE" EMAIL="$EMAIL" python3 - "$PARTNER" "${ITEMS[@]}" <<'PY'
 import json, os, sys
 partner_id, *items = sys.argv[1:]
 client = {
@@ -130,13 +147,17 @@ client = {
 }
 if os.environ["VDIGIT"] != "":
     client["verification_digit"] = int(os.environ["VDIGIT"])
+if os.environ["PHONE"] != "":
+    client["phone_number"] = os.environ["PHONE"]
+if os.environ["EMAIL"] != "":
+    client["email"] = os.environ["EMAIL"]
 details = []
 for it in items:
     pid, qty = it.split(":")
     pid, qty = int(pid), int(qty)
     assert pid >= 1 and qty >= 1, f"bad item {it}"
     details.append({"product_id": pid, "quantity": qty})
-print(json.dumps({"partner_id": int(partner_id), "client": client, "details": details}))
+print(json.dumps({"partner_id": int(partner_id), "ticket_id": os.environ["TICKET_NO"], "client": client, "details": details}))
 PY
 )" || die "failed to build JSON body"
 

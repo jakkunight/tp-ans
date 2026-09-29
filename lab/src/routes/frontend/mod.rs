@@ -1,10 +1,14 @@
 //! # Server-rendered client pages.
 //!
-//! Askama + HTMX interface for end customers: self-identification at
+//! Askama + HTMX interface for end customers: OTP self-identification at
 //! `GET /clients/login` and the points-redemption dashboard at
-//! `GET /clients/{client_id}/redeem`. The pages call the JSON REST API
-//! ([`crate::routes::api`]) from the browser, carrying the client JWT from
-//! `localStorage`.
+//! `GET /clients/{client_id}/redeem`.
+//!
+//! Privacy rule: the redeem page is a PII-free shell (redeemable catalog
+//! only). Identity, CI and point totals are fetched in the browser from the
+//! JSON REST API ([`crate::routes::api`]) with the client JWT from
+//! `localStorage`, so no credential ever renders server-side without the
+//! [`client_auth`](crate::jwt::client_auth) layer having checked it.
 use std::sync::Arc;
 
 use askama::Template;
@@ -17,7 +21,7 @@ use axum::{
 };
 use tracing::error;
 
-use crate::{AppState, models::Clients};
+use crate::{AppState, db};
 
 /// Builds the frontend router: `/`, `/clients/login` and
 /// `/clients/{client_id}/redeem`.
@@ -69,9 +73,11 @@ pub async fn root() -> impl IntoResponse {
 /// Self-identification form template (`templates/client_login.html`).
 struct ClientLoginTemplate {}
 
-/// Login page where a client identifies with CI + first/last name.
-/// The form calls `POST /api/v1/clients/login`, stores the JWT
-/// (1hr expiry) in `localStorage`, then redirects to the redeem page.
+/// Login page where a client identifies with his CI and proves ownership of
+/// his SMS/email channel with a one-time code. Step 1 calls
+/// `POST /api/v1/clients/otp/request`, step 2 calls
+/// `POST /api/v1/clients/otp/verify`, which stores the JWT (1hr expiry) in
+/// `localStorage` and redirects to the redeem page.
 pub async fn client_login_page() -> impl IntoResponse {
     render_or_error(ClientLoginTemplate {})
 }
@@ -96,86 +102,58 @@ struct RedeemableProductView {
 
 #[derive(Template)]
 #[template(path = "client_redeem.html")]
-/// Points dashboard template (`templates/client_redeem.html`).
+/// Points dashboard shell template (`templates/client_redeem.html`).
+///
+/// Carries no PII: only the dashboard owner id (for the JS fetch URL) and
+/// the public redeemable catalog. Names, CI and balances load client-side
+/// through the authenticated API.
 struct ClientRedeemTemplate {
     /// `clients.id` of the dashboard owner (also the redeem route id).
     client_id: i32,
-    /// `clients.ci` display value.
-    ci: i32,
-    /// `clients.first_name` display value.
-    first_name: String,
-    /// `clients.last_name` display value.
-    last_name: String,
-    /// Sum of `point_earnings` over his tickets.
-    total_earned_points: i32,
-    /// Spendable points (equals earned until redemptions persist).
-    balance_points: i32,
     /// Redeemable catalog, ordered by product name.
     products: Vec<RedeemableProductView>,
 }
 
-/// Dashboard where an identified client sees their point balance and
-/// redeems points for `redeemable_products`. The form calls
-/// `POST /api/v1/clients/{client_id}/redeem_points` with the stored JWT.
+/// Dashboard shell where an identified client sees their point balance and
+/// redeems points for `redeemable_products`. Only the public catalog renders
+/// server-side; the client profile and ledger totals load in the browser via
+/// `GET /api/v1/clients/{client_id}` with the stored JWT (which the
+/// [`client_auth`](crate::jwt::client_auth) layer scopes to the owner), so
+/// this page leaks no PII to unauthenticated viewers.
+///
+/// # Errors
+///
+/// Returns [`StatusCode::NOT_FOUND`] for an unknown client id and
+/// [`StatusCode::INTERNAL_SERVER_ERROR`] on DB failures.
 pub async fn client_redeem_page(
     State(state): State<Arc<AppState>>,
     Path(client_id): Path<i32>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client: Clients = sqlx::query_as::<_, Clients>(
-        "SELECT id, ci, verification_digit, first_name, last_name FROM clients WHERE id = $1",
-    )
-    .bind(client_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        error!("client_redeem_page: client lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
-
-    let total_earned_points: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(pe.earned_points), 0) FROM point_earnings pe
-         JOIN tickets t ON t.id = pe.ticket_id WHERE t.client_id = $1",
-    )
-    .bind(client_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        error!("client_redeem_page: points lookup failed: {e:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let total_earned_points: i32 = total_earned_points.try_into().unwrap_or(i32::MAX);
-
-    let rows: Vec<(i32, String, String, i32)> = sqlx::query_as(
-        "SELECT p.id, p.name, p.description, rp.points_needed
-         FROM redeemable_products rp JOIN products p ON p.id = rp.product_id
-         ORDER BY p.name ASC, p.id ASC",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        error!("client_redeem_page: redeemable lookup failed: {e:?}");
+    // Existence check only: nothing about the client renders here.
+    db::client_by_id(&state.db, client_id)
+        .await
+        .map_err(|e| match e {
+            db::DbError::NotFound { .. } => StatusCode::NOT_FOUND,
+            _ => {
+                error!("client_redeem_page: client lookup failed: {e:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+    let catalog = db::redeemable_catalog(&state.db).await.map_err(|e| {
+        error!("client_redeem_page: catalog failed: {e:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     let template = ClientRedeemTemplate {
-        client_id: client.id,
-        ci: client.ci,
-        first_name: client.first_name,
-        last_name: client.last_name,
-        total_earned_points,
-        // No `redemptions` table exists yet, so history is 0.
-        balance_points: total_earned_points,
-        products: rows
+        client_id,
+        products: catalog
             .into_iter()
-            .map(
-                |(product_id, name, description, points_needed)| RedeemableProductView {
-                    product_id,
-                    name,
-                    description,
-                    points_needed,
-                },
-            )
+            .map(|row| RedeemableProductView {
+                product_id: row.product_id,
+                name: row.name,
+                description: row.description,
+                points_needed: row.points_needed,
+            })
             .collect(),
     };
     Ok(render_or_error(template))

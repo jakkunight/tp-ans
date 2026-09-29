@@ -6,41 +6,78 @@
 <main class="max-w-md mx-auto p-6">
   <h1 class="text-2xl font-bold mb-2">Identificarse</h1>
   <p class="text-sm opacity-80 mb-4">
-    Ingresá tu CI, nombre y apellido para identificarte.
-    El dígito verificador (<span class="font-mono">CI-dígito</span>) es opcional y no se usa aquí.
+    Ingresá tu CI y te enviamos un código de 6 dígitos por SMS o email.
+    El código vence en 5 minutos.
   </p>
-  <form id="client-login-form" class="flex flex-col gap-3">
+  <form id="otp-request-form" class="flex flex-col gap-3">
     <label class="flex flex-col gap-1">
       <span>CI</span>
       <input class="border rounded px-3 py-2" type="number" name="ci" min="0" required placeholder="Ej. 1234567" />
     </label>
+    <button class="border rounded px-3 py-2 font-semibold" type="submit">Enviar código</button>
+  </form>
+  <form id="otp-verify-form" class="hidden flex-col gap-3 mt-4">
+    <p class="text-sm opacity-80" id="otp-sent-info"></p>
     <label class="flex flex-col gap-1">
-      <span>Nombre</span>
-      <input class="border rounded px-3 py-2" type="text" name="first_name" maxlength="32" required placeholder="Ej. María" />
-    </label>
-    <label class="flex flex-col gap-1">
-      <span>Apellido</span>
-      <input class="border rounded px-3 py-2" type="text" name="last_name" maxlength="32" required placeholder="Ej. González" />
+      <span>Código de 6 dígitos</span>
+      <input class="border rounded px-3 py-2 font-mono" type="text" name="code" inputmode="numeric"
+             pattern="[0-9]{6}" maxlength="6" required placeholder="Ej. 482913" />
     </label>
     <button class="border rounded px-3 py-2 font-semibold" type="submit">Ingresar</button>
   </form>
   <p id="client-login-error" class="text-sm mt-3" role="alert"></p>
 </main>
 <script>
-  const form = document.getElementById("client-login-form");
+  const reqForm = document.getElementById("otp-request-form");
+  const verForm = document.getElementById("otp-verify-form");
+  const sentInfo = document.getElementById("otp-sent-info");
   const errBox = document.getElementById("client-login-error");
-  form.addEventListener("submit", async (e) => {
+  let ci = null;
+
+  reqForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     errBox.textContent = "";
-    const data = new FormData(form);
-    const body = {
-      ci: Number(data.get("ci")),
-      first_name: String(data.get("first_name") || ""),
-      last_name: String(data.get("last_name") || ""),
-    };
+    const data = new FormData(reqForm);
+    ci = Number(data.get("ci"));
     let res;
     try {
-      res = await fetch("/api/v1/clients/login", {
+      res = await fetch("/api/v1/clients/otp/request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ci }),
+      });
+    } catch {
+      errBox.textContent = "No se pudo contactar al servidor.";
+      return;
+    }
+    if (res.status === 404) {
+      errBox.textContent = "Ese CI no está registrado. Pedí en tu farmacia que te registren.";
+      return;
+    }
+    if (res.status === 429) {
+      errBox.textContent = "Demasiados intentos. Esperá unos minutos y probá de nuevo.";
+      return;
+    }
+    if (!res.ok) {
+      errBox.textContent = "No se pudo enviar el código. Verificá tu CI.";
+      return;
+    }
+    const payload = await res.json();
+    sentInfo.textContent =
+      "Código enviado por " + (payload.channel || "SMS") +
+      " a " + (payload.destination_masked || "") + ".";
+    verForm.classList.remove("hidden");
+    verForm.classList.add("flex");
+  });
+
+  verForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    errBox.textContent = "";
+    const data = new FormData(verForm);
+    const body = { ci, code: String(data.get("code") || "") };
+    let res;
+    try {
+      res = await fetch("/api/v1/clients/otp/verify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -49,8 +86,12 @@
       errBox.textContent = "No se pudo contactar al servidor.";
       return;
     }
+    if (res.status === 429) {
+      errBox.textContent = "Cuenta bloqueada por intentos fallidos. Esperá 15 minutos.";
+      return;
+    }
     if (!res.ok) {
-      errBox.textContent = "No se pudo identificar al cliente. Verificá tus datos.";
+      errBox.textContent = "Código inválido o vencido. Pedí uno nuevo si hace falta.";
       return;
     }
     const payload = await res.json();
@@ -59,7 +100,7 @@
       // The JWT payload carries client_id; decode it to jump to the redeem page.
       try {
         const claims = JSON.parse(atob(payload.token.split(".")[1]));
-        const clientId = claims.client_id || claims.clientId || claims.sub;
+        const clientId = claims.client_id;
         if (clientId !== undefined && clientId !== null && String(clientId).length > 0) {
           window.location.href = "/clients/" + encodeURIComponent(String(clientId)) + "/redeem";
           return;

@@ -1,19 +1,20 @@
 {% extends "base.html" %}
 
-{% block title %}Canjear puntos — {{ first_name }} {{ last_name }}{% endblock %}
+{% block title %}Canjear puntos{% endblock %}
 
 {% block content %}
 <main class="max-w-2xl mx-auto p-6 flex flex-col gap-6">
   <section>
     <h1 class="text-2xl font-bold">Canjear puntos</h1>
     <p class="text-sm opacity-80">
-      Cliente: <strong>{{ first_name }} {{ last_name }}</strong>
-      (CI {{ ci }}, ID {{ client_id }})
+      Cliente: <strong id="client-name">…</strong>
+      <span id="client-ids"></span>
     </p>
     <p class="mt-2">
-      Puntos acumulados: <strong id="points-balance">{{ balance_points }}</strong>
-      <span class="text-sm opacity-70">(ganados: {{ total_earned_points }})</span>
+      Puntos acumulados: <strong id="points-balance">…</strong>
+      <span class="text-sm opacity-70" id="points-breakdown"></span>
     </p>
+    <p id="dashboard-error" class="text-sm mt-2" role="alert"></p>
   </section>
 
   <section>
@@ -53,9 +54,48 @@
   </section>
 </main>
 <script>
+  const clientId = {{ client_id }};
+  const dashErr = document.getElementById("dashboard-error");
+
+  // Identity and balances load through the authenticated API: the server
+  // never renders them into this page, so the JWT scope check applies.
+  async function loadDashboard() {
+    const token = localStorage.getItem("lab_client_token");
+    if (!token) {
+      window.location.href = "/clients/login";
+      return;
+    }
+    let res;
+    try {
+      res = await fetch("/api/v1/clients/" + encodeURIComponent(String(clientId)), {
+        headers: { "Authorization": "Bearer " + token },
+      });
+    } catch {
+      dashErr.textContent = "No se pudo contactar al servidor.";
+      return;
+    }
+    if (res.status === 401 || res.status === 403) {
+      window.location.href = "/clients/login";
+      return;
+    }
+    if (!res.ok) {
+      dashErr.textContent = "No se pudo cargar tu información.";
+      return;
+    }
+    const d = await res.json();
+    document.getElementById("client-name").textContent =
+      d.client.first_name + " " + d.client.last_name;
+    document.getElementById("client-ids").textContent =
+      "(CI " + d.client.ci + ", ID " + d.client.id + ")";
+    document.getElementById("points-balance").textContent = String(d.balance_points);
+    let extra = "ganados: " + d.total_earned_points + ", canjeados: " + d.total_redeemed_points;
+    if (d.cancelled_points > 0) extra += ", anulados: " + d.cancelled_points;
+    document.getElementById("points-breakdown").textContent = "(" + extra + ")";
+  }
+  loadDashboard();
+
   const redeemForm = document.getElementById("redeem-form");
   const redeemMsg = document.getElementById("redeem-message");
-  const clientId = {{ client_id }};
   if (redeemForm) {
     redeemForm.addEventListener("submit", async (e) => {
       e.preventDefault();

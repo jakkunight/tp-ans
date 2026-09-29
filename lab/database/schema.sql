@@ -135,7 +135,7 @@ create table redemptions (
 create table redemption_items (
     id serial not null primary key,
     redemption_id int not null references redemptions(id),
-    product_id int not null unique references redeemable_products(
+    product_id int not null references redeemable_products(
         id
     ) on delete cascade,
     quantity int not null check (quantity >= 1),

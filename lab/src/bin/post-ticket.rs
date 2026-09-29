@@ -36,6 +36,7 @@ struct TicketDetail {
 }
 
 /// Buyer identity from the factura; the server registers him when unknown.
+/// New clients need at least one contact (the schema requires an OTP channel).
 #[derive(Debug, Clone, Serialize)]
 struct TicketClient {
     /// `clients.ci` (unique) lookup key.
@@ -47,6 +48,12 @@ struct TicketClient {
     first_name: String,
     /// Buyer last name as printed on the factura.
     last_name: String,
+    /// SMS channel for OTP codes; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone_number: Option<String>,
+    /// Email channel for OTP codes; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
 }
 
 /// Body for `POST /api/v1/partners/tickets`.
@@ -54,6 +61,8 @@ struct TicketClient {
 struct CreateTicketRequest {
     /// `partners.id` of the issuing pharmacy.
     partner_id: i32,
+    /// Invoice number from the factura (unique per partner).
+    ticket_id: String,
     /// Buyer data; registered on the fly when the CI is unknown.
     client: TicketClient,
     /// At least one product line.
@@ -61,22 +70,26 @@ struct CreateTicketRequest {
 }
 
 /// Body for `DELETE /api/v1/partners/tickets`.
+///
+/// Cancellation is an audit entry: the rows stay intact, a cancellation is
+/// recorded with the `reason`, and awarded points are reversed.
 #[derive(Debug, Clone, Serialize)]
 struct DeleteTicketRequest {
     /// `tickets.id` of the invoice to void.
     ticket_id: i32,
+    /// Why the invoice is voided (`varchar(256)`).
+    reason: String,
 }
 
 /// Mirrors `routes::api::dto::PartnerLoginRequest`:
-/// partners authenticate with their RUC (natural key); `secret` is an
-/// optional pre-shared credential.
+/// partners authenticate with their RUC (natural key) plus the pre-shared
+/// key stored as `partners.psk_hash`.
 #[derive(Debug, Clone, Serialize)]
 struct PartnerLoginRequest {
     /// `partners.ruc` of the pharmacy logging in.
     ruc: String,
-    /// Optional pre-shared credential; omitted when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    secret: Option<String>,
+    /// Pre-shared key; verified against `psk_hash`, never stored.
+    psk: String,
 }
 
 /// Successful login reply (`LoginResponse`): the JWT to reuse as a bearer token.
@@ -105,6 +118,14 @@ struct Args {
     last_name: Option<String>,
     /// `--verification-digit`: optional RUC suffix digit.
     verification_digit: Option<String>,
+    /// `--ticket-id`: invoice number from the factura.
+    ticket_id: Option<String>,
+    /// `--phone`: buyer SMS channel (for new clients).
+    phone: Option<String>,
+    /// `--email`: buyer email channel (for new clients).
+    email: Option<String>,
+    /// `--reason`: void reason for `--delete`.
+    reason: Option<String>,
     /// `--item` values (`PID:QTY`, repeatable).
     items: Vec<String>,
     /// `--base-url`: API base URL override.
@@ -127,33 +148,37 @@ struct Args {
 const HELP: &str = r#"post-ticket — post tickets to the lab API from the terminal.
 
 Usage (one-shot):
-  post-ticket --partner ID --ci CI --first-name NAME --last-name NAME --item PID:QTY [...] [options]
-  post-ticket --login-partner RUC [--login-secret SECRET]   # partner login only
-  post-ticket --login-partner RUC --partner ID --ci CI ...  # login, then act as partner
-  post-ticket --delete TICKET_ID [options]
+  post-ticket --partner ID --ticket-id NRO --ci CI --first-name NAME --last-name NAME --item PID:QTY [...] [options]
+  post-ticket --login-partner RUC --login-secret PSK   # partner login only
+  post-ticket --login-partner RUC --login-secret PSK --partner ID --ticket-id NRO --ci CI ...  # login, then post
+  post-ticket --delete TICKET_ID --reason MOTIVO [options]
 
 Usage (interactive TUI):
   post-ticket [--tui] [--base-url URL] [--token TOKEN]
 
 Options:
   --partner ID     Partner (farmacia) id. Required unless --delete/--login-partner alone.
+  --ticket-id NRO  Invoice number from the factura (unique per partner). Required to post.
   --ci CI          Buyer CI from the factura (client is registered if new).
                    Required unless --delete/--login-partner alone.
   --first-name N   Buyer first name as printed on the factura. Required unless --delete/--login-partner alone.
   --last-name N    Buyer last name as printed on the factura. Required unless --delete/--login-partner alone.
   --verification-digit D
                    Optional <CI>-<D> RUC suffix digit (0-9).
+  --phone NUM      Buyer phone (SMS channel for OTP). New clients need --phone and/or --email.
+  --email ADDR     Buyer email (channel for OTP). New clients need --phone and/or --email.
   --login-partner RUC
                    Log the partner in (POST /api/v1/partners/login) and print
                    the JWT. Combined with --partner/--delete it authenticates
                    that same invocation instead of --token.
-  --login-secret S Optional pre-shared partner credential for the login.
+  --login-secret S Pre-shared partner key for the login (required with --login-partner).
   --item PID:QTY   One ticket line; repeatable. At least one required.
                    Example: --item 1:2 --item 3:1
   --base-url URL   API base URL. Default: $LAB_BASE_URL or http://127.0.0.1:8080
   --token TOKEN    Bearer JWT for the ticket routes (required). Default:
                    $LAB_JWT_TOKEN; use --login-partner to mint one.
   --delete ID      Void ticket ID instead of posting (DELETE /partners/tickets).
+  --reason MOTIVO  Why the invoice is voided. Required with --delete.
   --dry-run        Print the JSON body without sending it.
   --tui            Force the interactive Ratatui interface.
   -h, --help       Show this help plus the seed-data IDs.
@@ -169,9 +194,12 @@ TUI keys:
 
 Seed data (lab/database/seed.sql):
   Partners: 1 Farmacia Central (RUC 80012345-1), 2 Farmacia del Sur (RUC 80067890-2)
-  Clients:  1 María González (CI 1234567), 2 Juan Pérez (CI 2345678), 3 Ana López
-  Products: 1 Paracetamol (10 pts), 2 Ibuprofeno (8 pts), 3 Vitamina C (5 pts),
-            4 Crema (3 pts), 5 Termo (canje 100 pts), 6 Mochila (canje 250 pts)
+  Clients:  12 clientes (1 María González CI 1234567, 2 Juan Pérez CI 2345678, ...)
+  Products: 12 (1 Paracetamol 10 pts, 2 Ibuprofeno 8 pts, 3 Vitamina C 5 pts,
+            4 Crema 3 pts, 7 Alcohol 6 pts, 8 Jabón 4 pts, 9 Protector 12 pts;
+            canje: 5 Termo 100 pts, 6 Mochila 250 pts, 3 Vitamina 50 pts,
+            10 Termo Dep. 150 pts, 11 Gorra 80 pts, 12 Kit 300 pts)
+  Tickets:  12 demo (partner 1: 001-001-0000001..08, partner 2: 002-001-0000001..04)
 "#;
 
 /// Parses `std::env::args` into [`Args`]; unknown flags are an error.
@@ -191,6 +219,10 @@ fn parse_args() -> Result<Args> {
                 args.verification_digit =
                     Some(it.next().context("--verification-digit needs a value")?)
             }
+            "--ticket-id" => args.ticket_id = Some(it.next().context("--ticket-id needs a value")?),
+            "--phone" => args.phone = Some(it.next().context("--phone needs a value")?),
+            "--email" => args.email = Some(it.next().context("--email needs a value")?),
+            "--reason" => args.reason = Some(it.next().context("--reason needs a value")?),
             "--item" => args.items.push(it.next().context("--item needs a value")?),
             "--base-url" => args.base_url = Some(it.next().context("--base-url needs a value")?),
             "--login-partner" => {
@@ -221,7 +253,7 @@ fn base_url(args: &Args) -> String {
 }
 
 /// Resolves the bearer JWT: `--token`, then `LAB_JWT_TOKEN`, else empty
-/// (the API currently accepts unauthenticated calls).
+/// (the ticket routes reject unauthenticated calls with 401).
 fn token(args: &Args) -> String {
     args.token
         .clone()
@@ -283,19 +315,37 @@ fn non_empty(raw: Option<&str>, flag: &str) -> Result<String> {
     Ok(v)
 }
 
+/// Requires a non-blank form value, trimmed.
+fn non_empty_str(raw: &str, what: &str) -> Result<String> {
+    let v = raw.trim().to_string();
+    if v.is_empty() {
+        bail!("{what} is required");
+    }
+    Ok(v)
+}
+
 /// Builds the ticket buyer from raw flag/field values, validating CI, names
-/// and the optional verification digit.
+/// and the optional verification digit. Blank contacts become `None`.
 fn build_client(
     ci: Option<&str>,
     first_name: Option<&str>,
     last_name: Option<&str>,
     verification_digit: Option<&str>,
+    phone: Option<&str>,
+    email: Option<&str>,
 ) -> Result<TicketClient> {
+    let contact = |raw: Option<&str>| {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     Ok(TicketClient {
         ci: parse_ci(ci.context("--ci is required")?)?,
         verification_digit: verification_digit.map(parse_vdigit).transpose()?,
         first_name: non_empty(first_name, "--first-name")?,
         last_name: non_empty(last_name, "--last-name")?,
+        phone_number: contact(phone),
+        email: contact(email),
     })
 }
 
@@ -376,15 +426,20 @@ async fn post_ticket_reqwest(
     Ok((status, pretty_json(&body)))
 }
 
-/// `DELETE`s a ticket by id; returns the HTTP status plus the pretty reply body.
+/// `DELETE`s a ticket by id with a void reason; returns the HTTP status plus
+/// the pretty reply body.
 async fn delete_ticket_reqwest(
     base: &str,
     token: &str,
     ticket_id: i32,
+    reason: &str,
 ) -> Result<(reqwest::StatusCode, String)> {
     let mut call = http_client()?
         .delete(format!("{base}/api/v1/partners/tickets"))
-        .json(&DeleteTicketRequest { ticket_id });
+        .json(&DeleteTicketRequest {
+            ticket_id,
+            reason: reason.to_string(),
+        });
     if !token.is_empty() {
         call = call.bearer_auth(token);
     }
@@ -394,18 +449,16 @@ async fn delete_ticket_reqwest(
     Ok((status, pretty_json(&body)))
 }
 
-/// Logs a partner in by RUC; returns the HTTP status plus the pretty reply body.
+/// Logs a partner in by RUC + pre-shared key; returns the HTTP status plus
+/// the pretty reply body.
 async fn partner_login_reqwest(
     base: &str,
     ruc: &str,
-    secret: Option<&str>,
+    psk: &str,
 ) -> Result<(reqwest::StatusCode, String)> {
     let req = PartnerLoginRequest {
         ruc: ruc.to_string(),
-        secret: secret
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        psk: psk.to_string(),
     };
     let res = http_client()?
         .post(format!("{base}/api/v1/partners/login"))
@@ -439,18 +492,21 @@ async fn run_oneshot(args: &Args) -> Result<()> {
     // JWT; combined with --partner/--delete it authenticates this same
     // invocation (overriding --token).
     if let Some(ruc) = &args.login_partner {
+        let psk = args
+            .login_secret
+            .as_deref()
+            .context("--login-secret PSK is required with --login-partner")?;
         if args.dry_run {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&PartnerLoginRequest {
                     ruc: ruc.clone(),
-                    secret: args.login_secret.clone(),
+                    psk: psk.to_string(),
                 })?
             );
             return Ok(());
         }
-        let (status, resp) =
-            partner_login_reqwest(&base, ruc, args.login_secret.as_deref()).await?;
+        let (status, resp) = partner_login_reqwest(&base, ruc, psk).await?;
         println!("LOGIN HTTP {status}\n{resp}");
         if !status.is_success() {
             bail!("login replied with {status}");
@@ -470,12 +526,16 @@ async fn run_oneshot(args: &Args) -> Result<()> {
 
     if let Some(raw) = &args.delete {
         let ticket_id = parse_id(raw, "ticket id")?;
-        let body = serde_json::to_string_pretty(&DeleteTicketRequest { ticket_id })?;
+        let reason = non_empty(args.reason.as_deref(), "--reason")?;
+        let body = serde_json::to_string_pretty(&DeleteTicketRequest {
+            ticket_id,
+            reason: reason.clone(),
+        })?;
         if args.dry_run {
             println!("{body}");
             return Ok(());
         }
-        let (status, resp) = delete_ticket_reqwest(&base, &tok, ticket_id).await?;
+        let (status, resp) = delete_ticket_reqwest(&base, &tok, ticket_id, &reason).await?;
         println!("HTTP {status}\n{resp}");
         if !status.is_success() {
             bail!("server replied with {status}");
@@ -494,10 +554,13 @@ async fn run_oneshot(args: &Args) -> Result<()> {
         args.first_name.as_deref(),
         args.last_name.as_deref(),
         args.verification_digit.as_deref(),
+        args.phone.as_deref(),
+        args.email.as_deref(),
     )?;
     let details = parse_items(&args.items)?;
     let req = CreateTicketRequest {
         partner_id,
+        ticket_id: non_empty(args.ticket_id.as_deref(), "--ticket-id")?,
         client,
         details,
     };
@@ -527,33 +590,41 @@ const FIELD_BASE: usize = 0;
 const FIELD_TOKEN: usize = 1;
 /// Partner login RUC text field.
 const FIELD_LOGIN_RUC: usize = 2;
-/// Partner login secret text field (masked on screen).
+/// Partner login PSK text field (masked on screen).
 const FIELD_LOGIN_SECRET: usize = 3;
 /// Ticket partner id text field.
 const FIELD_PARTNER: usize = 4;
+/// Invoice number (`tickets.ticket_id`) text field.
+const FIELD_TICKET_NO: usize = 5;
 /// Buyer CI text field.
-const FIELD_CI: usize = 5;
+const FIELD_CI: usize = 6;
 /// Buyer first-name text field.
-const FIELD_FIRST: usize = 6;
+const FIELD_FIRST: usize = 7;
 /// Buyer last-name text field.
-const FIELD_LAST: usize = 7;
+const FIELD_LAST: usize = 8;
 /// Buyer verification-digit text field.
-const FIELD_VDIGIT: usize = 8;
+const FIELD_VDIGIT: usize = 9;
+/// Buyer phone (SMS OTP channel) text field.
+const FIELD_PHONE: usize = 10;
+/// Buyer email (OTP channel) text field.
+const FIELD_EMAIL: usize = 11;
 /// Ticket id to void text field.
-const FIELD_DELETE: usize = 9;
+const FIELD_DELETE: usize = 12;
+/// Void reason text field.
+const FIELD_REASON: usize = 13;
 /// Number of fixed text fields.
-const TEXT_FIELDS: usize = 10;
+const TEXT_FIELDS: usize = 14;
 
 // Collapsible sections.
 /// Connection section: base URL + token.
 const SEC_CONN: usize = 0;
-/// Partner-login section: RUC + secret.
+/// Partner-login section: RUC + PSK.
 const SEC_LOGIN: usize = 1;
 /// Invoice section: partner id + buyer data.
 const SEC_TICKET: usize = 2;
 /// Products section: dynamic `PID:QTY` lines.
 const SEC_ITEMS: usize = 3;
-/// Void section: ticket id to delete.
+/// Void section: ticket id + reason to delete.
 const SEC_VOID: usize = 4;
 /// Number of collapsible sections.
 const SECTION_COUNT: usize = 5;
@@ -634,11 +705,15 @@ impl App {
             args.login_partner.clone().unwrap_or_default(),
             args.login_secret.clone().unwrap_or_default(),
             args.partner.clone().unwrap_or_default(),
+            args.ticket_id.clone().unwrap_or_default(),
             args.ci.clone().unwrap_or_default(),
             args.first_name.clone().unwrap_or_default(),
             args.last_name.clone().unwrap_or_default(),
             args.verification_digit.clone().unwrap_or_default(),
+            args.phone.clone().unwrap_or_default(),
+            args.email.clone().unwrap_or_default(),
             args.delete.clone().unwrap_or_default(),
+            args.reason.clone().unwrap_or_default(),
         ];
         let mut app = Self {
             fields,
@@ -676,17 +751,23 @@ impl App {
                     }
                     SEC_TICKET => {
                         v.push(Focus::Field(FIELD_PARTNER));
+                        v.push(Focus::Field(FIELD_TICKET_NO));
                         v.push(Focus::Field(FIELD_CI));
                         v.push(Focus::Field(FIELD_FIRST));
                         v.push(Focus::Field(FIELD_LAST));
                         v.push(Focus::Field(FIELD_VDIGIT));
+                        v.push(Focus::Field(FIELD_PHONE));
+                        v.push(Focus::Field(FIELD_EMAIL));
                     }
                     SEC_ITEMS => {
                         for i in 0..self.items.len() {
                             v.push(Focus::Item(i));
                         }
                     }
-                    SEC_VOID => v.push(Focus::Field(FIELD_DELETE)),
+                    SEC_VOID => {
+                        v.push(Focus::Field(FIELD_DELETE));
+                        v.push(Focus::Field(FIELD_REASON));
+                    }
                     _ => unreachable!("section index out of range"),
                 }
             }
@@ -714,17 +795,23 @@ impl App {
                     }
                     SEC_TICKET => {
                         r.push(RowKind::Field(FIELD_PARTNER));
+                        r.push(RowKind::Field(FIELD_TICKET_NO));
                         r.push(RowKind::Field(FIELD_CI));
                         r.push(RowKind::Field(FIELD_FIRST));
                         r.push(RowKind::Field(FIELD_LAST));
                         r.push(RowKind::Field(FIELD_VDIGIT));
+                        r.push(RowKind::Field(FIELD_PHONE));
+                        r.push(RowKind::Field(FIELD_EMAIL));
                     }
                     SEC_ITEMS => {
                         for i in 0..self.items.len() {
                             r.push(RowKind::Item(i));
                         }
                     }
-                    SEC_VOID => r.push(RowKind::Field(FIELD_DELETE)),
+                    SEC_VOID => {
+                        r.push(RowKind::Field(FIELD_DELETE));
+                        r.push(RowKind::Field(FIELD_REASON));
+                    }
                     _ => unreachable!("section index out of range"),
                 }
             }
@@ -875,18 +962,12 @@ impl App {
         if ruc.is_empty() {
             bail!("login RUC is required");
         }
-        let secret = self.fields[FIELD_LOGIN_SECRET].trim().to_string();
+        let psk = self.fields[FIELD_LOGIN_SECRET].trim().to_string();
+        if psk.is_empty() {
+            bail!("login PSK is required");
+        }
         self.busy = true;
-        let out = partner_login_reqwest(
-            &base,
-            &ruc,
-            if secret.is_empty() {
-                None
-            } else {
-                Some(secret.as_str())
-            },
-        )
-        .await;
+        let out = partner_login_reqwest(&base, &ruc, &psk).await;
         self.busy = false;
         let (status, body) = out?;
         if !status.is_success() {
@@ -905,8 +986,13 @@ impl App {
             .trim_end_matches('/')
             .to_string();
         let tok = self.fields[FIELD_TOKEN].trim().to_string();
+        let contact = |i: usize| {
+            let v = self.fields[i].trim().to_string();
+            if v.is_empty() { None } else { Some(v) }
+        };
         let req = CreateTicketRequest {
             partner_id: parse_id(self.fields[FIELD_PARTNER].trim(), "partner id")?,
+            ticket_id: non_empty_str(self.fields[FIELD_TICKET_NO].trim(), "nro. factura")?,
             client: build_client(
                 Some(&self.fields[FIELD_CI]),
                 Some(&self.fields[FIELD_FIRST]),
@@ -916,6 +1002,8 @@ impl App {
                 } else {
                     Some(self.fields[FIELD_VDIGIT].as_str())
                 },
+                contact(FIELD_PHONE).as_deref(),
+                contact(FIELD_EMAIL).as_deref(),
             )?,
             details: parse_items(&self.items)?,
         };
@@ -943,8 +1031,9 @@ impl App {
             .to_string();
         let tok = self.fields[FIELD_TOKEN].trim().to_string();
         let ticket_id = parse_id(self.fields[FIELD_DELETE].trim(), "ticket id")?;
+        let reason = non_empty_str(self.fields[FIELD_REASON].trim(), "motivo")?;
         self.busy = true;
-        let out = delete_ticket_reqwest(&base, &tok, ticket_id).await;
+        let out = delete_ticket_reqwest(&base, &tok, ticket_id, &reason).await;
         self.busy = false;
         let (status, body) = out?;
         Ok(format!("DELETE → HTTP {status}\n{body}"))
@@ -969,13 +1058,17 @@ const FIELD_TITLES: [&str; TEXT_FIELDS] = [
     "Base URL",
     "JWT token (required, filled by login)",
     "Login RUC (partner)",
-    "Login secret (optional)",
+    "Login PSK (required)",
     "Partner ID",
+    "Nro. factura (ticket_id)",
     "Client CI (de la factura)",
     "Client first name",
     "Client last name",
     "Verif. digit (optional)",
+    "Phone (SMS OTP, optional)",
+    "Email (OTP, optional)",
     "Ticket ID (para anular)",
+    "Motivo (para anular)",
 ];
 
 /// Whether a fixed field holds a secret (masked with `•` on screen).
@@ -1325,7 +1418,7 @@ mod tests {
         let full_rows = app.rows().len();
         assert!(full_focus > 5 && full_rows > 5);
 
-        // Collapse the ticket section: its 5 fields vanish from focus/rows.
+        // Collapse the ticket section: its 8 fields vanish from focus/rows.
         app.focus = app
             .focusables()
             .iter()
@@ -1333,8 +1426,8 @@ mod tests {
             .unwrap();
         app.toggle_section();
         assert!(app.collapsed[SEC_TICKET]);
-        assert_eq!(app.focusables().len(), full_focus - 5);
-        assert_eq!(app.rows().len(), full_rows - 5);
+        assert_eq!(app.focusables().len(), full_focus - 8);
+        assert_eq!(app.rows().len(), full_rows - 8);
         assert_eq!(app.focus_item(), Focus::Section(SEC_TICKET));
 
         app.toggle_section();

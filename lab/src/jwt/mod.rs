@@ -4,19 +4,25 @@
 //! ([`crate::routes::api`]). Two claim shapes exist — one per actor:
 //!
 //! * [`PartnerClaims`] for pharmacies ([`partners`](crate::models::Partners)),
-//!   minted by `POST /api/v1/partners/login`.
+//!   minted by `POST /api/v1/partners/login` with an 8-hour expiry.
 //! * [`ClientClaims`] for end customers ([`clients`](crate::models::Clients)),
-//!   minted by `POST /api/v1/clients/login` with a 1-hour expiry.
+//!   minted by `POST /api/v1/clients/otp/verify` with a 1-hour expiry.
 //!
 //! Tokens are HS256-signed with the `LAB_JWT_SECRET` environment secret via
-//! [`create_token`] and checked with [`validate_token`]. [`jwt_middleware`]
-//! is the Axum layer that enforces `Authorization: Bearer <token>` and
-//! exposes the decoded [`Claims`] through request extensions.
+//! [`create_token`] and checked with [`validate_token`]. Authentication and
+//! actor scoping live in the middleware layers [`partner_auth`] (pharmacy
+//! routes) and [`client_auth`] (customer routes): each validates the bearer
+//! token and additionally checks the token actor matches the targeted
+//! resource, so handlers never see a mismatched actor.
 //!
-//! Claim payloads carry internal ids only — never passwords, tokens or other
-//! secrets beyond the partner's pre-shared credential.
+//! Claim payloads carry internal numeric ids only — never passwords, PSKs,
+//! OTP codes or other secrets.
+use std::sync::Arc;
+
 use axum::{
-    extract::Request,
+    Json,
+    body::Body,
+    extract::{Request, State},
     http::{StatusCode, header},
     middleware::Next,
     response::Response,
@@ -25,19 +31,20 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
+use crate::{AppState, routes::api::dto::ErrorResponse};
+
 /// JWT claims identifying an authenticated partner (pharmacy).
 ///
-/// Encoded as the [`Claims::Partner`] variant. The `partner_secret` is the
-/// optional pre-shared credential supplied at login, echoed back so
-/// downstream handlers can re-verify it without a DB round-trip.
+/// Encoded as the [`Claims::Partner`] variant. Carries the partner id plus
+/// an absolute expiry only: the pre-shared key is verified at login and
+/// never echoed into the token (JWT payloads are merely base64, not
+/// encrypted).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PartnerClaims {
-    /// `partners.id` of the authenticated pharmacy, as a string.
-    partner_id: String,
-    /// Pre-shared credential supplied at login (may be empty).
-    partner_secret: String,
-    /// Optional absolute expiry; `None` means the token does not expire.
-    expires: Option<DateTime<Utc>>,
+    /// `partners.id` of the authenticated pharmacy.
+    partner_id: i32,
+    /// Absolute expiry (login time + 8 hours).
+    expires: DateTime<Utc>,
 }
 
 impl TryFrom<Claims> for PartnerClaims {
@@ -58,27 +65,31 @@ impl TryFrom<Claims> for PartnerClaims {
 
 impl PartnerClaims {
     /// Builds partner claims from their parts.
-    pub fn new(partner_id: String, partner_secret: String, expires: Option<DateTime<Utc>>) -> Self {
+    pub fn new(partner_id: i32, expires: DateTime<Utc>) -> Self {
         Self {
             partner_id,
-            partner_secret,
             expires,
         }
+    }
+
+    /// `partners.id` of the authenticated pharmacy.
+    pub fn partner_id(&self) -> i32 {
+        self.partner_id
     }
 }
 
 /// JWT claims identifying an authenticated end customer.
 ///
-/// Encoded as the [`Claims::Client`] variant. Client logins only check `ci`
-/// plus first/last name (the verification digit is optional data), and the
-/// resulting token always expires one hour after issue.
+/// Encoded as the [`Claims::Client`] variant. The client proves ownership of
+/// his SMS/email channel with a one-time code, and the resulting token
+/// always expires one hour after issue.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClientClaims {
-    /// `clients.id` of the authenticated customer, as a string.
-    client_id: String,
-    /// `clients.ci` of the authenticated customer, as a string.
-    client_ci: String,
-    /// Absolute expiry (login time + 1 hour).
+    /// `clients.id` of the authenticated customer.
+    client_id: i32,
+    /// `clients.ci` of the authenticated customer.
+    client_ci: i32,
+    /// Absolute expiry (verification time + 1 hour).
     expires: DateTime<Utc>,
 }
 
@@ -100,12 +111,17 @@ impl TryFrom<Claims> for ClientClaims {
 
 impl ClientClaims {
     /// Builds client claims from their parts.
-    pub fn new(client_id: String, client_ci: String, expires: DateTime<Utc>) -> Self {
+    pub fn new(client_id: i32, client_ci: i32, expires: DateTime<Utc>) -> Self {
         Self {
             client_id,
             client_ci,
             expires,
         }
+    }
+
+    /// `clients.id` of the authenticated customer.
+    pub fn client_id(&self) -> i32 {
+        self.client_id
     }
 }
 
@@ -139,57 +155,38 @@ impl From<PartnerClaims> for Claims {
 
 /// Signs `claims` into a compact JWT with the `LAB_JWT_SECRET` secret.
 ///
+/// The bare inner claims object is signed (e.g. `{"partner_id": ...}`),
+/// which is why [`Claims`] deserializes `untagged`.
+///
 /// # Errors
 ///
 /// Fails when `LAB_JWT_SECRET` is unset or when `jsonwebtoken` cannot encode
 /// the claims.
 pub fn create_token(claims: Claims) -> anyhow::Result<String> {
-    match claims {
-        Claims::Partner(p) => {
-            let secret = match std::env::var("LAB_JWT_SECRET") {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("{e:?}");
-                    anyhow::bail!(e)
-                }
-            };
-            match encode(
-                &Header::default(),
-                &p,
-                &EncodingKey::from_secret(&secret.into_bytes()),
-            ) {
-                Ok(t) => {
-                    tracing::info!("Token created");
-                    return Ok(t);
-                }
-                Err(_) => {
-                    tracing::error!("Failed to create token");
-                    anyhow::bail!("Failed to create token")
-                }
-            }
+    let secret = match std::env::var("LAB_JWT_SECRET") {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("{e:?}");
+            anyhow::bail!(e)
         }
-        Claims::Client(c) => {
-            let secret = match std::env::var("LAB_JWT_SECRET") {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("{e:?}");
-                    anyhow::bail!(e)
-                }
-            };
-            match encode(
-                &Header::default(),
-                &c,
-                &EncodingKey::from_secret(&secret.into_bytes()),
-            ) {
-                Ok(t) => {
-                    tracing::info!("Token created");
-                    return Ok(t);
-                }
-                Err(_) => {
-                    tracing::error!("Failed to create token");
-                    anyhow::bail!("Failed to create token")
-                }
-            }
+    };
+    let payload = match &claims {
+        Claims::Partner(p) => serde_json::to_value(p),
+        Claims::Client(c) => serde_json::to_value(c),
+    }
+    .map_err(|_| anyhow::anyhow!("Failed to encode token claims"))?;
+    match encode(
+        &Header::default(),
+        &payload,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    ) {
+        Ok(t) => {
+            tracing::info!("Token created");
+            Ok(t)
+        }
+        Err(_) => {
+            tracing::error!("Failed to create token");
+            anyhow::bail!("Failed to create token")
         }
     }
 }
@@ -199,7 +196,7 @@ pub fn create_token(claims: Claims) -> anyhow::Result<String> {
 /// Our tokens carry expiry in the custom `expires` field rather than the
 /// standard `exp` claim, so stock `exp` validation is disabled and the
 /// custom field is enforced instead: expired client tokens (minted with +1h)
-/// and expired partner tokens are rejected.
+/// and expired partner tokens (minted with +8h) are rejected.
 ///
 /// # Errors
 ///
@@ -218,14 +215,14 @@ pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
     validation.required_spec_claims.clear();
     match decode(
         token,
-        &DecodingKey::from_secret(&secret.into_bytes()),
+        &DecodingKey::from_secret(secret.as_bytes()),
         &validation,
     ) {
         Ok(d) => {
             let claims: Claims = d.claims;
             let expired = match &claims {
                 Claims::Client(c) => c.expires < Utc::now(),
-                Claims::Partner(p) => p.expires.is_some_and(|e| e < Utc::now()),
+                Claims::Partner(p) => p.expires < Utc::now(),
             };
             if expired {
                 tracing::warn!("validate_token: rejected (expired token)");
@@ -241,40 +238,146 @@ pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
     }
 }
 
-/// Axum middleware enforcing `Authorization: Bearer <token>`.
+/// Rejection of an auth/scope middleware: the HTTP status plus a JSON
+/// [`ErrorResponse`] body (same shape as every other API failure).
+pub type AuthError = (StatusCode, Json<ErrorResponse>);
+
+/// Builds a `401` [`AuthError`].
+fn unauthorized(error: &'static str) -> AuthError {
+    (StatusCode::UNAUTHORIZED, Json(ErrorResponse::new(error)))
+}
+
+/// Builds a `403` [`AuthError`].
+fn forbidden(error: &'static str) -> AuthError {
+    (StatusCode::FORBIDDEN, Json(ErrorResponse::new(error)))
+}
+
+/// Validates the `Authorization: Bearer <token>` header into [`Claims`].
 ///
-/// On success the decoded [`Claims`] are inserted into the request
-/// extensions for downstream handlers; otherwise the request is rejected
-/// with [`StatusCode::UNAUTHORIZED`].
-pub async fn jwt_middleware(mut req: Request, next: Next) -> Result<Response, StatusCode> {
-    // 1. Get the Authorization header
-    let auth_header = req
+/// # Errors
+///
+/// Returns `401` when the header is missing/malformed or the token is
+/// invalid or expired.
+fn bearer_claims(req: &Request) -> Result<Claims, AuthError> {
+    let token = req
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| unauthorized("missing token"))?;
+    validate_token(token).map_err(|_| unauthorized("invalid token"))
+}
 
-    // 2. Make sure it starts with "Bearer "
-    let token = match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            &header["Bearer ".len()..] // slice off "Bearer " prefix
-        }
-        _ => {
-            // No token or wrong format — reject with 401
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+/// Axum middleware for the pharmacy routes: bearer auth plus same-partner
+/// scoping, in one choke point.
+///
+/// The token must carry [`Claims::Partner`]; anything else (client token,
+/// missing or invalid token) is rejected. The targeted partner is then
+/// checked against the token: for `POST` it comes from the JSON body's
+/// `partner_id` (the body is buffered and rebuilt, so the handler still
+/// receives it); for `DELETE` the body carries only `ticket_id`, so the
+/// ticket owner is looked up in the DB.
+///
+/// Handlers behind this layer never see a mismatched actor.
+pub async fn partner_auth(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let partner_id = match bearer_claims(&req)? {
+        Claims::Partner(claims) => claims.partner_id(),
+        Claims::Client(_) => return Err(forbidden("forbidden partner")),
     };
-
-    // 3. Validate the token
-    match validate_token(token) {
-        Ok(claims) => {
-            // 4. Attach the claims to the request so handlers can use them
-            req.extensions_mut().insert(claims);
-            // 5. Pass the request to the next layer (your handler)
-            Ok(next.run(req).await)
+    if req.method() == axum::http::Method::POST {
+        let (parts, body) = req.into_parts();
+        let bytes = axum::body::to_bytes(body, 64 * 1024)
+            .await
+            .map_err(|_| unauthorized("unreadable body"))?;
+        let body_partner: Option<i32> = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|body| {
+                body.get("partner_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|id| id.try_into().ok())
+            });
+        if body_partner != Some(partner_id) {
+            tracing::warn!("partner_auth: rejected (partner scope mismatch)");
+            return Err(forbidden("forbidden partner"));
         }
-        Err(_) => {
-            // Invalid or expired token — reject with 401
-            Err(StatusCode::UNAUTHORIZED)
-        }
+        let req = Request::from_parts(parts, Body::from(bytes));
+        return Ok(next.run(req).await);
     }
+    if req.method() == axum::http::Method::DELETE {
+        let (parts, body) = req.into_parts();
+        let bytes = axum::body::to_bytes(body, 64 * 1024)
+            .await
+            .map_err(|_| unauthorized("unreadable body"))?;
+        let ticket_id: Option<i32> = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|body| {
+                body.get("ticket_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|id| id.try_into().ok())
+            });
+        let Some(ticket_id) = ticket_id else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid body")),
+            ));
+        };
+        let owner: Option<i32> = sqlx::query_scalar("SELECT partner_id FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| {
+                tracing::error!("partner_auth: owner lookup failed: {e:?}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("database error")),
+                )
+            })?;
+        match owner {
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse::new("ticket not found")),
+                ));
+            }
+            Some(owner) if owner != partner_id => {
+                tracing::warn!("partner_auth: rejected (partner scope mismatch)");
+                return Err(forbidden("forbidden partner"));
+            }
+            _ => {}
+        }
+        let req = Request::from_parts(parts, Body::from(bytes));
+        return Ok(next.run(req).await);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Axum middleware for the customer routes: bearer auth plus same-client
+/// scoping, in one choke point.
+///
+/// The token must carry [`Claims::Client`] whose id matches the `{client_id}`
+/// path segment (`/api/v1/clients/{client_id}` and
+/// `/api/v1/clients/{client_id}/redeem_points`); anything else is rejected.
+///
+/// Handlers behind this layer never see a mismatched actor.
+pub async fn client_auth(req: Request, next: Next) -> Result<Response, AuthError> {
+    let client_id = match bearer_claims(&req)? {
+        Claims::Client(claims) => claims.client_id(),
+        Claims::Partner(_) => return Err(forbidden("forbidden client")),
+    };
+    let target: Option<i32> = req
+        .uri()
+        .path()
+        .strip_prefix("/api/v1/clients/")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|segment| segment.parse().ok());
+    if target != Some(client_id) {
+        tracing::warn!("client_auth: rejected (client scope mismatch)");
+        return Err(forbidden("forbidden client"));
+    }
+    Ok(next.run(req).await)
 }

@@ -38,7 +38,9 @@ struct BaseTemplate {
 /// # Arguments
 ///
 /// * `assets_path` — directory served verbatim at `/assets`.
-/// * `state` — shared [`AppState`] (Postgres pool) given to every handler.
+/// * `state` — shared [`AppState`] (Postgres pool, OTP guard) given to every
+///   handler and to the stateful [`partner_auth`](crate::jwt::partner_auth)
+///   layer.
 ///
 /// # Errors
 ///
@@ -52,7 +54,7 @@ pub fn create_app(assets_path: PathBuf, state: Arc<AppState>) -> anyhow::Result<
     info!("Assets Path: {p}");
     Ok(Router::new()
         .nest_service("/assets", ServeDir::new(assets_path))
-        .merge(create_api()?)
+        .merge(create_api(&state)?)
         .merge(create_frontend()?)
         .layer(loopback_cors())
         .with_state(state))
