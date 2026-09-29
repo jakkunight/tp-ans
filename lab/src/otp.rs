@@ -91,8 +91,9 @@ pub enum OtpError {
 /// Picks the delivery channel and destination for a client.
 ///
 /// An explicitly requested channel wins when the client has a destination
-/// for it; otherwise SMS is preferred (cheaper to read on a feature phone),
-/// falling back to email. The schema guarantees at least one contact exists.
+/// for it; otherwise email is preferred (cheaper and more reliable than
+/// SMS), falling back to SMS. The schema guarantees at least one contact
+/// exists.
 ///
 /// # Errors
 ///
@@ -112,15 +113,15 @@ pub fn channel_for(
             .map(|d| (channel, d))
             .ok_or(OtpError::ChannelUnavailable { channel });
     }
-    if let Some(phone) = client.phone_number.clone() {
-        return Ok((OtpChannel::Sms, phone));
-    }
     if let Some(email) = client.email.clone() {
         return Ok((OtpChannel::Email, email));
     }
-    // Unreachable under the schema CHECK, but SMS-first keeps the error sane.
+    if let Some(phone) = client.phone_number.clone() {
+        return Ok((OtpChannel::Sms, phone));
+    }
+    // Unreachable under the schema CHECK, but email-first keeps the error sane.
     Err(OtpError::ChannelUnavailable {
-        channel: OtpChannel::Sms,
+        channel: OtpChannel::Email,
     })
 }
 
@@ -314,15 +315,26 @@ pub fn mask_email(email: &str) -> String {
 
 /// Dispatches an OTP code over the client's channel.
 ///
-/// `LAB_OTP_SENDER` selects the backend (default `"log"`): the log sender
-/// records the masked destination and — dev only — the code itself, so the
-/// login loop works with no provider configured. A production sender (Twilio,
-/// SNS, SES, …) must implement this function and MUST NOT log codes.
+/// `LAB_OTP_SENDER` selects the backend (default `"log"`):
+///
+/// * `"log"` — records the masked destination and — dev only — the code
+///   itself, so the login loop works with no provider configured.
+/// * `"smtp"` — sends a real email through Gmail's SMTP relay via
+///   [`lettre`], authenticated with `EMAIL_FROM` (the Gmail address) plus
+///   the `EMAIL_APP_PASSWORD` secret (a Gmail app password, never the
+///   account password). The blocking SMTP round-trip runs on Tokio's
+///   blocking pool. Production senders MUST NOT log codes.
+///
+/// SMS delivery has no provider wired yet: requesting the SMS channel with
+/// `LAB_OTP_SENDER=smtp` fails with a clear error (use `"log"` while no SMS
+/// provider is configured).
 ///
 /// # Errors
 ///
-/// Fails for an unknown `LAB_OTP_SENDER` value.
-pub fn send_otp(channel: OtpChannel, destination: &str, code: &str) -> anyhow::Result<()> {
+/// Fails for an unknown `LAB_OTP_SENDER` value, for missing `EMAIL_FROM` /
+/// `EMAIL_APP_PASSWORD` in SMTP mode, for unparseable addresses, and for
+/// SMTP transport failures.
+pub async fn send_otp(channel: OtpChannel, destination: &str, code: &str) -> anyhow::Result<()> {
     let mode = std::env::var("LAB_OTP_SENDER").unwrap_or_else(|_| "log".to_string());
     match mode.trim().to_ascii_lowercase().as_str() {
         "log" => {
@@ -340,8 +352,84 @@ pub fn send_otp(channel: OtpChannel, destination: &str, code: &str) -> anyhow::R
             );
             Ok(())
         }
+        "smtp" => {
+            let masked = match channel {
+                OtpChannel::Sms => mask_phone(destination),
+                OtpChannel::Email => mask_email(destination),
+            };
+            // DEV ONLY: the code is logged so the OTP loop works without an
+            // SMS/email provider. Production senders must not log codes.
+            tracing::info!(
+                channel = channel.name(),
+                destination = masked.as_str(),
+                code = code,
+                "otp dispatched (log sender; dev only)"
+            );
+            if channel != OtpChannel::Email {
+                anyhow::bail!("smtp sender only delivers email; {masked} needs an SMS provider");
+            }
+            let from: String = match std::env::var("EMAIL_FROM") {
+                Ok(s) if !s.trim().is_empty() => s,
+                _ => anyhow::bail!("EMAIL_FROM must be set for the smtp sender"),
+            };
+            let app_password: String = match std::env::var("EMAIL_APP_PASSWORD") {
+                Ok(s) if !s.is_empty() => s,
+                _ => anyhow::bail!("EMAIL_APP_PASSWORD must be set for the smtp sender"),
+            };
+            let to = destination.to_string();
+            let code = code.to_string();
+            tokio::task::spawn_blocking(move || {
+                send_email_blocking(&from, &app_password, &to, &code)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("smtp worker failed: {e}"))??;
+            tracing::info!(
+                channel = channel.name(),
+                destination = masked.as_str(),
+                "otp dispatched (smtp)"
+            );
+            Ok(())
+        }
         other => anyhow::bail!("unknown LAB_OTP_SENDER backend: {other}"),
     }
+}
+
+/// Sends one OTP email through Gmail's SMTP relay (blocking).
+///
+/// Called from [`send_otp`] on the blocking pool. The app password is used
+/// only for SMTP auth and is never logged.
+///
+/// # Errors
+///
+/// Fails on invalid addresses or SMTP transport errors.
+fn send_email_blocking(from: &str, app_password: &str, to: &str, code: &str) -> anyhow::Result<()> {
+    use lettre::{
+        Message, SmtpTransport, Transport, message::Mailbox,
+        transport::smtp::authentication::Credentials,
+    };
+
+    let email: Message = Message::builder()
+        .from(
+            from.parse::<Mailbox>()
+                .map_err(|e| anyhow::anyhow!("invalid EMAIL_FROM address: {e}"))?,
+        )
+        .to(to
+            .parse::<Mailbox>()
+            .map_err(|e| anyhow::anyhow!("invalid recipient address: {e}"))?)
+        .subject("Tu código de acceso")
+        .body(format!(
+            "Tu código de acceso al sistema de puntos es: {code}\n\
+             Vence en {} minutos. Si no lo pediste, ignorá este mensaje.",
+            OTP_TTL_SECS / 60
+        ))?;
+    let mailer: SmtpTransport = SmtpTransport::relay("smtp.gmail.com")
+        .map_err(|e| anyhow::anyhow!("smtp relay setup failed: {e}"))?
+        .credentials(Credentials::new(from.to_string(), app_password.to_string()))
+        .build();
+    mailer
+        .send(&email)
+        .map_err(|e| anyhow::anyhow!("smtp send failed: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -400,5 +488,59 @@ mod tests {
         assert!(!mask_phone("+595981123456").contains("123456"));
         assert!(!mask_email("maria@example.com").contains("maria"));
         assert!(mask_email("maria@example.com").contains("@example.com"));
+    }
+
+    /// Test client with both OTP channels.
+    fn both_channels_client() -> Clients {
+        Clients {
+            id: 1,
+            ci: 1234567,
+            verification_digit: None,
+            first_name: "Test".to_string(),
+            last_name: "User".to_string(),
+            phone_number: Some("+595981000000".to_string()),
+            email: Some("test@example.com".to_string()),
+        }
+    }
+
+    /// Email is the default channel; SMS is the fallback.
+    #[test]
+    fn channel_defaults_to_email_then_sms() {
+        let both = both_channels_client();
+        assert_eq!(
+            channel_for(&both, None).unwrap(),
+            (OtpChannel::Email, "test@example.com".to_string())
+        );
+        let mut sms_only = both.clone();
+        sms_only.email = None;
+        assert_eq!(
+            channel_for(&sms_only, None).unwrap(),
+            (OtpChannel::Sms, "+595981000000".to_string())
+        );
+        let mut email_only = both.clone();
+        email_only.phone_number = None;
+        assert_eq!(
+            channel_for(&email_only, None).unwrap(),
+            (OtpChannel::Email, "test@example.com".to_string())
+        );
+    }
+
+    /// Forced channels are honored, or report the missing destination.
+    #[test]
+    fn channel_forced_or_unavailable() {
+        let mut client = both_channels_client();
+        client.phone_number = None;
+        assert_eq!(
+            channel_for(&client, Some(OtpChannel::Email)).unwrap(),
+            (OtpChannel::Email, "test@example.com".to_string())
+        );
+        assert_eq!(
+            channel_for(&client, Some(OtpChannel::Sms)),
+            Err(OtpError::ChannelUnavailable {
+                channel: OtpChannel::Sms
+            })
+        );
+        assert_eq!(OtpChannel::parse("sms").unwrap(), OtpChannel::Sms);
+        assert_eq!(OtpChannel::parse("bogus"), Err(OtpError::UnknownChannel));
     }
 }

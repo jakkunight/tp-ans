@@ -16,8 +16,14 @@
 //! * `LAB_JWT_SECRET` — HMAC secret used to sign/verify JWTs.
 //! * `LAB_OTP_SECRET` — secret used to derive client OTP codes; falls back to
 //!   `LAB_JWT_SECRET` when unset.
-//! * `LAB_OTP_SENDER` — OTP delivery backend (`log` by default; logs the
-//!   masked destination and — dev only — the code itself).
+//! * `LAB_OTP_SENDER` — OTP delivery backend: `"log"` (default; logs the
+//!   masked destination and — dev only — the code itself) or `"smtp"`
+//!   (sends a real email through Gmail via `lettre`).
+//! * `EMAIL_FROM` — Gmail address the OTP emails are sent from (required for
+//!   `"smtp"`; must be the account the app password belongs to).
+//! * `EMAIL_APP_PASSWORD` — Gmail app password for `EMAIL_FROM` (required
+//!   for `"smtp"`; from the `EMAIL_APP_PASSWORD` secret, never the account
+//!   password).
 //!
 //! The server listens on `127.0.0.1:8080`.
 #![deny(missing_docs)]

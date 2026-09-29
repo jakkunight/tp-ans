@@ -274,10 +274,12 @@ pub async fn request_client_otp(
     })?;
     // Window math lives in `otp`; this only needs "now" for expiry display.
     let code = otp::generate_code(&secret, client.ci, otp::current_window());
-    otp::send_otp(channel, &destination, &code).map_err(|e| {
-        tracing::error!("request_client_otp: dispatch failed: {e:?}");
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, "otp dispatch failed")
-    })?;
+    otp::send_otp(channel, &destination, &code)
+        .await
+        .map_err(|e| {
+            tracing::error!("request_client_otp: dispatch failed: {e:?}");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "otp dispatch failed")
+        })?;
 
     let masked = match channel {
         OtpChannel::Sms => otp::mask_phone(&destination),
