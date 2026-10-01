@@ -40,6 +40,7 @@ use axum::http::StatusCode;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{
+    fiscal::{Cdc, InvoiceNumber, Ruc, check_cdc_consistency},
     models::{
         Clients, Partners, PointLedger, Products, PromotionProducts, RedeemableProducts,
         RedemptionDiscounts, RedemptionItems, Redemptions, TicketCancellationDiscounts,
@@ -185,7 +186,7 @@ pub async fn authenticate_partner(
     psk: &str,
 ) -> Result<Partners, DbError> {
     let partner: Option<Partners> = sqlx::query_as::<_, Partners>(
-        "SELECT id, name, ruc, psk_hash, is_active FROM partners WHERE ruc = $1",
+        "SELECT id, name, ruc, psk_hash, is_active, domicilio, actividad_economica FROM partners WHERE ruc = $1",
     )
     .bind(ruc)
     .fetch_optional(pool)
@@ -216,12 +217,16 @@ pub async fn authenticate_partner(
 pub struct NewClient<'a> {
     /// `clients.ci` lookup key.
     pub ci: i32,
-    /// Optional RUC suffix digit.
+    /// RUC check digit (`<ci>-<digit>`); mod-11 must match `ci` when present.
     pub verification_digit: Option<i32>,
     /// Buyer first name.
     pub first_name: &'a str,
     /// Buyer last name.
     pub last_name: &'a str,
+    /// Company name for juridical receptors.
+    pub razon_social: Option<&'a str>,
+    /// Receptor address printed on the factura.
+    pub domicilio: Option<&'a str>,
     /// SMS channel (at least one contact required for new clients).
     pub phone_number: Option<&'a str>,
     /// Email channel (at least one contact required for new clients).
@@ -232,6 +237,7 @@ pub struct NewClient<'a> {
 ///
 /// Returns the row plus whether it was created. New clients require at least
 /// one contact (the schema CHECK); existing rows keep their stored contacts.
+/// Fiscal fields (`razon_social`, `domicilio`) are stored on creation only.
 ///
 /// # Errors
 ///
@@ -242,7 +248,7 @@ pub async fn find_or_create_client(
     client: NewClient<'_>,
 ) -> Result<(Clients, bool), DbError> {
     let existing: Option<Clients> = sqlx::query_as::<_, Clients>(
-        "SELECT id, ci, verification_digit, first_name, last_name, phone_number, email
+        "SELECT id, ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email
          FROM clients WHERE ci = $1",
     )
     .bind(client.ci)
@@ -258,13 +264,15 @@ pub async fn find_or_create_client(
         });
     }
     let insert = sqlx::query(
-        "INSERT INTO clients (ci, verification_digit, first_name, last_name, phone_number, email)
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (ci) DO NOTHING",
+        "INSERT INTO clients (ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (ci) DO NOTHING",
     )
     .bind(client.ci)
     .bind(client.verification_digit)
     .bind(client.first_name)
     .bind(client.last_name)
+    .bind(client.razon_social)
+    .bind(client.domicilio)
     .bind(client.phone_number)
     .bind(client.email)
     .execute(&mut **tx)
@@ -277,7 +285,7 @@ pub async fn find_or_create_client(
     // Either we inserted, or a concurrent transaction won the race: either
     // way the row exists now.
     let row: Clients = sqlx::query_as::<_, Clients>(
-        "SELECT id, ci, verification_digit, first_name, last_name, phone_number, email
+        "SELECT id, ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email
          FROM clients WHERE ci = $1",
     )
     .bind(client.ci)
@@ -293,7 +301,7 @@ pub async fn find_or_create_client(
 /// Returns [`DbError::NotFound`] for unknown ids.
 pub async fn client_by_id(pool: &PgPool, client_id: i32) -> Result<Clients, DbError> {
     sqlx::query_as::<_, Clients>(
-        "SELECT id, ci, verification_digit, first_name, last_name, phone_number, email
+        "SELECT id, ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email
          FROM clients WHERE id = $1",
     )
     .bind(client_id)
@@ -311,7 +319,7 @@ pub async fn client_by_id(pool: &PgPool, client_id: i32) -> Result<Clients, DbEr
 /// Returns [`DbError::NotFound`] for unknown CIs.
 pub async fn client_by_ci(pool: &PgPool, ci: i32) -> Result<Clients, DbError> {
     sqlx::query_as::<_, Clients>(
-        "SELECT id, ci, verification_digit, first_name, last_name, phone_number, email
+        "SELECT id, ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email
          FROM clients WHERE ci = $1",
     )
     .bind(ci)
@@ -338,8 +346,12 @@ pub struct TicketLine {
 pub struct NewTicket<'a> {
     /// `partners.id` of the issuing pharmacy.
     pub partner_id: i32,
-    /// Invoice number from the factura (unique per partner).
+    /// Printed invoice number `EEE-PPP-NNNNNNN` (unique per partner).
     pub ticket_number: &'a str,
+    /// 8-digit timbrado (timbrado paper + electronic only).
+    pub timbrado: Option<&'a str>,
+    /// 44-digit SIFEN CDC (electronic only; requires `timbrado`).
+    pub cdc: Option<&'a str>,
     /// Buyer identity from the factura.
     pub client: NewClient<'a>,
     /// At least one line (checked by the handler).
@@ -359,24 +371,79 @@ pub struct CreatedTicket {
 /// Registers an invoice and awards its points, atomically.
 ///
 /// Inside one transaction: checks the partner (must exist and be active),
-/// find-or-creates the buyer, validates every product line, inserts the
-/// `tickets` row (scoped by `(partner_id, ticket_id)`), its `ticket_details`
-/// lines and — when at least one point was earned — a positive
-/// `point_ledger` row linked from `ticket_earnings`.
+/// validates the fiscal identity (number + timbrado + CDC, with CDC/number
+/// and CDC/emitter-RUC cross-checks), find-or-creates the buyer, validates
+/// every product line, inserts the `tickets` row (scoped by
+/// `(partner_id, ticket_id)`), its `ticket_details` lines and — when at
+/// least one point was earned — a positive `point_ledger` row linked from
+/// `ticket_earnings`.
 ///
 /// # Errors
 ///
 /// Returns [`DbError::NotFound`] for unknown partners/products,
-/// [`DbError::Forbidden`] for inactive partners, [`DbError::Conflict`] for a
-/// duplicate invoice number and [`DbError::Db`] on transport failures.
+/// [`DbError::Forbidden`] for inactive partners, [`DbError::Invalid`] for a
+/// malformed fiscal identity or CDC mismatch, [`DbError::Conflict`] for a
+/// duplicate invoice number (or duplicate CDC) and [`DbError::Db`] on
+/// transport failures.
 pub async fn create_ticket(pool: &PgPool, ticket: NewTicket<'_>) -> Result<CreatedTicket, DbError> {
+    // Fiscal shape first (no DB round-trip): number/timbrado/CDC formats,
+    // CDC check digit, CDC-without-timbrado, CDC number vs ticket number.
+    let invoice = InvoiceNumber::parse(ticket.ticket_number).map_err(|e| DbError::Invalid {
+        error: "invalid ticket number",
+        message: e.to_string(),
+    })?;
+    let timbrado = match ticket.timbrado {
+        None => None,
+        Some(raw) => {
+            let t = raw.trim();
+            if t.is_empty() {
+                None
+            } else {
+                crate::fiscal::Timbrado::parse(t).map_err(|e| DbError::Invalid {
+                    error: "invalid timbrado",
+                    message: e.to_string(),
+                })?;
+                Some(t)
+            }
+        }
+    };
+    let cdc = match ticket.cdc {
+        None => None,
+        Some(raw) => {
+            let c = raw.trim();
+            if c.is_empty() {
+                None
+            } else {
+                let parsed = Cdc::parse(c).map_err(|e| DbError::Invalid {
+                    error: "invalid cdc",
+                    message: e.to_string(),
+                })?;
+                // CDC number blocks must equal the printed number (emitter
+                // RUC is checked below once the partner row is locked).
+                if parsed.invoice_number() != invoice {
+                    return Err(DbError::Invalid {
+                        error: "invalid cdc",
+                        message: "CDC number does not match the invoice number".to_string(),
+                    });
+                }
+                Some(parsed)
+            }
+        }
+    };
+    if cdc.is_some() && timbrado.is_none() {
+        return Err(DbError::Invalid {
+            error: "invalid cdc",
+            message: "CDC requires timbrado".to_string(),
+        });
+    }
+
     let mut tx = pool.begin().await?;
 
     // Lock the partner row first (parent-before-child lock order): the
     // active check below stays true until this transaction commits, and
     // concurrent writers on the partner serialize here instead of racing it.
     let partner: Option<Partners> = sqlx::query_as::<_, Partners>(
-        "SELECT id, name, ruc, psk_hash, is_active FROM partners WHERE id = $1 FOR UPDATE",
+        "SELECT id, name, ruc, psk_hash, is_active, domicilio, actividad_economica FROM partners WHERE id = $1 FOR UPDATE",
     )
     .bind(ticket.partner_id)
     .fetch_optional(&mut *tx)
@@ -390,6 +457,20 @@ pub async fn create_ticket(pool: &PgPool, ticket: NewTicket<'_>) -> Result<Creat
         return Err(DbError::Forbidden {
             error: "inactive partner",
         });
+    }
+    // Partner RUC must itself be a valid `base-DV`; the CDC emitter check
+    // below depends on it.
+    let partner_ruc = Ruc::parse(&partner.ruc).map_err(|e| DbError::Invalid {
+        error: "invalid partner ruc",
+        message: e.to_string(),
+    })?;
+    if let Some(ref parsed_cdc) = cdc {
+        check_cdc_consistency(parsed_cdc, &invoice, &partner_ruc).map_err(|e| {
+            DbError::Invalid {
+                error: "invalid cdc",
+                message: e.to_string(),
+            }
+        })?;
     }
 
     let product_ids: Vec<i32> = ticket.details.iter().map(|d| d.product_id).collect();
@@ -442,9 +523,11 @@ pub async fn create_ticket(pool: &PgPool, ticket: NewTicket<'_>) -> Result<Creat
     let (client, _) = find_or_create_client(&mut tx, ticket.client).await?;
 
     let ticket_pk: i32 = sqlx::query_scalar(
-        "INSERT INTO tickets (ticket_id, partner_id, client_id) VALUES ($1, $2, $3) RETURNING id",
+        "INSERT INTO tickets (ticket_id, timbrado, cdc, partner_id, client_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
     )
     .bind(ticket.ticket_number)
+    .bind(timbrado)
+    .bind(cdc.as_ref().map(|c| c.as_str()))
     .bind(ticket.partner_id)
     .bind(client.id)
     .fetch_one(&mut *tx)
@@ -625,18 +708,23 @@ pub struct Redeemed {
 /// Prices and persists a points redemption, atomically.
 ///
 /// Inside one transaction: checks the client, resolves every line through
-/// `redeemable_products` (snapshotting `points_needed` per line), verifies
-/// the ledger balance covers the cost, then inserts the `redemptions` row,
-/// its `redemption_items`, a negative `point_ledger` entry and the
-/// `redemption_discounts` link.
+/// `redeemable_products` — the only price source (the API takes `products.id`
+/// lines and resolves them to the catalog entry, whose id is what
+/// `redemption_items.product_id` stores) — snapshotting `points_needed` per
+/// line, verifies the ledger balance covers the cost, then inserts the
+/// `redemptions` row, its `redemption_items`, a negative `point_ledger` entry
+/// and the `redemption_discounts` link.
+///
+/// Any product with a `redeemable_products` entry can be redeemed (the seed
+/// catalog covers every product), as long as the balance covers it; repeat
+/// redemptions of the same prize are allowed.
 ///
 /// # Errors
 ///
 /// Returns [`DbError::NotFound`] for unknown clients,
-/// [`DbError::Unprocessable`] for non-redeemable products,
-/// [`DbError::Conflict`] for insufficient points (or a catalog entry the
-/// schema's global-unique `redemption_items.product_id` already spent), and
-/// [`DbError::Db`] on transport failures.
+/// [`DbError::Unprocessable`] for products with no redeemable entry,
+/// [`DbError::Conflict`] for insufficient points, and [`DbError::Db`] on
+/// transport failures.
 pub async fn redeem_points(
     pool: &PgPool,
     client_id: i32,
@@ -728,20 +816,7 @@ pub async fn redeem_points(
         .bind(item.quantity)
         .bind(price)
         .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                DbError::Conflict {
-                    error: "prize already redeemed",
-                    message: format!(
-                        "product {} was already redeemed once (schema limits each prize to a single redemption row)",
-                        item.product_id
-                    ),
-                }
-            } else {
-                DbError::Db(e)
-            }
-        })?;
+        .await?;
     }
 
     let ledger: PointLedger = sqlx::query_as::<_, PointLedger>(
@@ -840,7 +915,7 @@ pub async fn client_dashboard(
         .await?;
 
     let client: Clients = sqlx::query_as::<_, Clients>(
-        "SELECT id, ci, verification_digit, first_name, last_name, phone_number, email
+        "SELECT id, ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email
          FROM clients WHERE id = $1",
     )
     .bind(client_id)
@@ -851,7 +926,7 @@ pub async fn client_dashboard(
     })?;
 
     let ticket_rows: Vec<Tickets> = sqlx::query_as::<_, Tickets>(
-        "SELECT id, ticket_id, date, partner_id, client_id FROM tickets
+        "SELECT id, ticket_id, timbrado, cdc, date, partner_id, client_id FROM tickets
          WHERE client_id = $1 ORDER BY date ASC, id ASC",
     )
     .bind(client_id)
@@ -883,6 +958,8 @@ pub async fn client_dashboard(
         tickets.push(TicketDto {
             id: t.id,
             ticket_number: t.ticket_id,
+            timbrado: t.timbrado,
+            cdc: t.cdc,
             date: t.date,
             partner_id: t.partner_id,
             client_id: t.client_id,
@@ -908,6 +985,8 @@ pub async fn client_dashboard(
             verification_digit: client.verification_digit,
             first_name: client.first_name,
             last_name: client.last_name,
+            razon_social: client.razon_social,
+            domicilio: client.domicilio,
             phone_number: client.phone_number,
             email: client.email,
         },

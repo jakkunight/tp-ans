@@ -28,6 +28,7 @@
 //! The server listens on `127.0.0.1:8080`.
 #![deny(missing_docs)]
 pub(crate) mod db;
+pub(crate) mod fiscal;
 pub(crate) mod jwt;
 pub(crate) mod models;
 pub(crate) mod otp;
@@ -53,6 +54,16 @@ impl AppState {
     /// Borrows the OTP rate-limit guard.
     pub(crate) fn otp_guard(&self) -> &OtpGuard {
         &self.otp_guard
+    }
+
+    /// Test-only constructor: shared state over an existing pool with a fresh
+    /// OTP guard (used by handler tests that never touch the network).
+    #[cfg(test)]
+    pub(crate) fn for_tests(db: PgPool) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            otp_guard: OtpGuard::new(),
+        })
     }
 }
 

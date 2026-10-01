@@ -57,12 +57,20 @@
   const clientId = {{ client_id }};
   const dashErr = document.getElementById("dashboard-error");
 
+  // Unauthenticated here means both transports are stale: drop them so the
+  // next visit goes through the server-side login redirect cleanly.
+  function logout() {
+    localStorage.removeItem("lab_client_token");
+    document.cookie = "lab_client_token=; Path=/; Max-Age=0; SameSite=Lax";
+    window.location.href = "/clients/login";
+  }
+
   // Identity and balances load through the authenticated API: the server
   // never renders them into this page, so the JWT scope check applies.
   async function loadDashboard() {
     const token = localStorage.getItem("lab_client_token");
     if (!token) {
-      window.location.href = "/clients/login";
+      logout();
       return;
     }
     let res;
@@ -75,7 +83,7 @@
       return;
     }
     if (res.status === 401 || res.status === 403) {
-      window.location.href = "/clients/login";
+      logout();
       return;
     }
     if (!res.ok) {

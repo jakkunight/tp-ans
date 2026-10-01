@@ -5,11 +5,15 @@
 # No jq needed.
 #
 # Usage:
-#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000002 --ci 1234567 --first-name María --last-name González --item 1:2
-#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000003 --ci 9990001 --first-name Ana --last-name López --phone +595983000001 --item 2:3 --base-url http://127.0.0.1:8080
-#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000004 --ci 1234567 --first-name María --last-name González --item 1:1 --token "$JWT" --dry-run
+#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000009 --ci 1234567 --first-name María --last-name González --item 1:2
+#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000010 --timbrado 12345678 --ci 9990001 --first-name Ana --last-name López --phone +595983000001 --item 2:3
+#   ./post-ticket.sh --partner 1 --ticket-id 001-001-0000001 --timbrado 12345678 --cdc 01800123450001001000000122026010110000000012 --ci 1234567 --first-name María --last-name González --item 1:1 --token "$JWT" --dry-run
 #   ./post-ticket.sh --delete 5 --reason "factura duplicada"  # void ticket 5 (DELETE /partners/tickets)
 #   ./post-ticket.sh --help                # show IDs from lab/database/seed.sql
+#
+# Fiscal identity (factura PY): paper sends only --ticket-id (EEE-PPP-NNNNNNN);
+# timbrado paper adds --timbrado (8 digits); electronic adds --timbrado + --cdc
+# (44 digits, SIFEN). --verification-digit is the RUC DV (mod-11 must match CI).
 #
 # The buyer is taken from the factura data and registered on the fly:
 # clients are looked up by CI (unique) and created when unknown. New clients
@@ -20,7 +24,7 @@
 # (see lab/src/bin/post-ticket.rs --login-partner --login-secret).
 #
 # Endpoint: POST /api/v1/partners/tickets
-#   Body: {"partner_id":1,"ticket_id":"001-001-0000002","client":{"ci":1234567,"first_name":"María","last_name":"González"},"details":[{"product_id":1,"quantity":2}]}
+#   Body: {"partner_id":1,"ticket_id":"001-001-0000009","timbrado":"12345678","client":{"ci":1234567,"first_name":"María","last_name":"González"},"details":[{"product_id":1,"quantity":2}]}
 #   Reply: {"ticket_id":N,"client_id":M,"earned_points":K}
 set -u
 
@@ -28,10 +32,14 @@ BASE_URL="${LAB_BASE_URL:-http://127.0.0.1:8080}"
 TOKEN="${LAB_JWT_TOKEN:-}"
 PARTNER=""
 TICKET_NO=""
+TIMBRADO=""
+CDC=""
 CI=""
 FIRST=""
 LAST=""
 VDIGIT=""
+RAZON=""
+DOMICILIO=""
 PHONE=""
 EMAIL=""
 REASON=""
@@ -49,13 +57,17 @@ Usage:
 
 Options:
   --partner ID     Partner (farmacia) id. Required unless --delete.
-  --ticket-id NRO  Invoice number from the factura (unique per partner). Required to post.
+  --ticket-id NRO  Printed invoice number EEE-PPP-NNNNNNN (unique per partner). Required to post.
+  --timbrado T     8-digit DNIT timbrado (timbrado paper + electronic only).
+  --cdc CDC        44-digit SIFEN CDC (electronic only; requires --timbrado).
   --ci CI          Buyer CI from the factura (client is registered if new).
                    Required unless --delete.
   --first-name N   Buyer first name as printed on the factura. Required unless --delete.
   --last-name N    Buyer last name as printed on the factura. Required unless --delete.
   --verification-digit D
-                   Optional <CI>-<D> RUC suffix digit (0-9).
+                   Optional <CI>-<D> RUC check digit (0-9, mod-11 must match CI).
+  --razon-social R Company name for juridical receptors (optional).
+  --domicilio DIR  Receptor address printed on the factura (optional).
   --phone NUM      Buyer phone (SMS channel for OTP). New clients need --phone and/or --email.
   --email ADDR     Buyer email (channel for OTP). New clients need --phone and/or --email.
   --item PID:QTY   One ticket line; repeatable. At least one required.
@@ -69,12 +81,13 @@ Options:
   -h, --help       Show this help plus the seed-data IDs.
 
 Seed data (lab/database/seed.sql):
-  Partners: 1 Farmacia Central (activa), 2 Farmacia del Sur (activa), 3 Inactiva
+  Partners: 1 Farmacia Central (RUC 80012345-0), 2 Farmacia del Sur (RUC 80067890-7), 3 Inactiva
   Clients:  12 clientes (1 María González CI 1234567, 2 Juan Pérez CI 2345678, ...)
   Products: 12 (1 Paracetamol 10 pts, 2 Ibuprofeno 8 pts, 3 Vitamina C 5 pts,
             4 Crema 3 pts, 7 Alcohol 6 pts, 8 Jabón 4 pts, 9 Protector 12 pts;
-            canje: 5 Termo 100 pts, 6 Mochila 250 pts, 3 Vitamina 50 pts,
-            10 Termo Dep. 150 pts, 11 Gorra 80 pts, 12 Kit 300 pts)
+            canje (todos con precio): 1 Paracet 10, 2 Ibupr 8, 3 Vitam 50,
+            4 Crema 3, 5 Termo 100, 6 Mochila 250, 7 Alcohol 6, 8 Jabón 4,
+            9 Protector 12, 10 Termo Dep. 150, 11 Gorra 80, 12 Kit 300)
 EOF
 }
 
@@ -84,10 +97,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --partner) PARTNER="${2:-}"; shift 2 ;;
     --ticket-id) TICKET_NO="${2:-}"; shift 2 ;;
+    --timbrado) TIMBRADO="${2:-}"; shift 2 ;;
+    --cdc) CDC="${2:-}"; shift 2 ;;
     --ci) CI="${2:-}"; shift 2 ;;
     --first-name) FIRST="${2:-}"; shift 2 ;;
     --last-name) LAST="${2:-}"; shift 2 ;;
     --verification-digit) VDIGIT="${2:-}"; shift 2 ;;
+    --razon-social) RAZON="${2:-}"; shift 2 ;;
+    --domicilio) DOMICILIO="${2:-}"; shift 2 ;;
     --phone) PHONE="${2:-}"; shift 2 ;;
     --email) EMAIL="${2:-}"; shift 2 ;;
     --reason) REASON="${2:-}"; shift 2 ;;
@@ -137,7 +154,7 @@ for it in "${ITEMS[@]}"; do
 done
 
 # Build JSON body with python3 (no jq needed).
-BODY="$(PARTNER="$PARTNER" TICKET_NO="$TICKET_NO" CI="$CI" FIRST="$FIRST" LAST="$LAST" VDIGIT="$VDIGIT" PHONE="$PHONE" EMAIL="$EMAIL" python3 - "$PARTNER" "${ITEMS[@]}" <<'PY'
+BODY="$(PARTNER="$PARTNER" TICKET_NO="$TICKET_NO" TIMBRADO="$TIMBRADO" CDC="$CDC" CI="$CI" FIRST="$FIRST" LAST="$LAST" VDIGIT="$VDIGIT" RAZON="$RAZON" DOMICILIO="$DOMICILIO" PHONE="$PHONE" EMAIL="$EMAIL" python3 - "$PARTNER" "${ITEMS[@]}" <<'PY'
 import json, os, sys
 partner_id, *items = sys.argv[1:]
 client = {
@@ -147,6 +164,10 @@ client = {
 }
 if os.environ["VDIGIT"] != "":
     client["verification_digit"] = int(os.environ["VDIGIT"])
+if os.environ["RAZON"] != "":
+    client["razon_social"] = os.environ["RAZON"]
+if os.environ["DOMICILIO"] != "":
+    client["domicilio"] = os.environ["DOMICILIO"]
 if os.environ["PHONE"] != "":
     client["phone_number"] = os.environ["PHONE"]
 if os.environ["EMAIL"] != "":
@@ -157,7 +178,12 @@ for it in items:
     pid, qty = int(pid), int(qty)
     assert pid >= 1 and qty >= 1, f"bad item {it}"
     details.append({"product_id": pid, "quantity": qty})
-print(json.dumps({"partner_id": int(partner_id), "ticket_id": os.environ["TICKET_NO"], "client": client, "details": details}))
+body = {"partner_id": int(partner_id), "ticket_id": os.environ["TICKET_NO"], "client": client, "details": details}
+if os.environ["TIMBRADO"] != "":
+    body["timbrado"] = os.environ["TIMBRADO"]
+if os.environ["CDC"] != "":
+    body["cdc"] = os.environ["CDC"]
+print(json.dumps(body))
 PY
 )" || die "failed to build JSON body"
 

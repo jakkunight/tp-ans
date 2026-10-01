@@ -19,41 +19,48 @@
 -- Partners (farmacias asociadas)
 -- ============================================================
 
-insert into partners (id, name, ruc, psk_hash, is_active) values
-    (1, 'Farmacia Central', '80012345-1', '$argon2id$v=19$m=19456,t=2,p=1$lu7T8NyVPRt+vnBa0x9V+Q$UFEkx3P/nz2FvWCCOlQcsS7bPLm/DW+XFCA19b2MyhY', true),
-    (2, 'Farmacia del Sur', '80067890-2', '$argon2id$v=19$m=19456,t=2,p=1$uLAQNdp+YZQd5VzlbwaoTg$s5E65818eBZ6q7dNDbbeDjyUubodbyqL8IfgtfmLvaY', true),
-    (3, 'Farmacia Inactiva', '80011111-3', '$argon2id$v=19$m=19456,t=2,p=1$Lg/pwyDTZaT3fbtp5WBc/A$RpxtsXZ4GqUeGbb4piMQ6dZ0QtfiBUWMR3K6uVKaGjQ', false)
+insert into partners (id, name, ruc, psk_hash, is_active, domicilio, actividad_economica) values
+    (1, 'Farmacia Central', '80012345-0', '$argon2id$v=19$m=19456,t=2,p=1$lu7T8NyVPRt+vnBa0x9V+Q$UFEkx3P/nz2FvWCCOlQcsS7bPLm/DW+XFCA19b2MyhY', true, 'Avda. Eusebio Ayala 123, Asunción', 'Venta de medicamentos'),
+    (2, 'Farmacia del Sur', '80067890-7', '$argon2id$v=19$m=19456,t=2,p=1$uLAQNdp+YZQd5VzlbwaoTg$s5E65818eBZ6q7dNDbbeDjyUubodbyqL8IfgtfmLvaY', true, 'Avda. San Martín 456, Encarnación', 'Venta de medicamentos'),
+    (3, 'Farmacia Inactiva', '80011111-7', '$argon2id$v=19$m=19456,t=2,p=1$Lg/pwyDTZaT3fbtp5WBc/A$RpxtsXZ4GqUeGbb4piMQ6dZ0QtfiBUWMR3K6uVKaGjQ', false, 'Calle Palma 789, Asunción', 'Venta de medicamentos')
 on conflict (id) do update set
     name = excluded.name,
     ruc = excluded.ruc,
     psk_hash = excluded.psk_hash,
-    is_active = excluded.is_active;
+    is_active = excluded.is_active,
+    domicilio = excluded.domicilio,
+    actividad_economica = excluded.actividad_economica;
 
 -- ============================================================
 -- Clients
 -- ci is UNIQUE and enough to identify the client; the verification
--- digit (<ci>-<digit> RUC suffix) is optional government-issued data.
+-- digit (<ci>-<digit> RUC suffix) is optional government-issued data and,
+-- when present, must be the mod-11 DV of ci (see src/fiscal.rs).
+-- Personas físicas use first/last name; personas jurídicas additionally
+-- carry razon_social. domicilio is the receptor address on the factura.
 -- Every client has at least one OTP channel (phone and/or email).
 -- ============================================================
 
-insert into clients (id, ci, verification_digit, first_name, last_name, phone_number, email) values
-    (1, 1234567, 1, 'María', 'González', '+595981111111', 'maria@example.com'),
-    (2, 2345678, 5, 'Juan', 'Pérez', '+595982222222', null),
-    (3, 3456789, null, 'Ana', 'López', null, 'ana@example.com'),
-    (4, 4567890, 2, 'Pedro', 'Sosa', '+595983444444', 'pedro@example.com'),
-    (5, 5678901, 7, 'Lucía', 'Fernández', '+595984555555', null),
-    (6, 6789012, 0, 'Carlos', 'Giménez', null, 'carlos@example.com'),
-    (7, 7890123, 4, 'Rosa', 'Ayala', '+595986777777', 'rosa@example.com'),
-    (8, 8901234, 9, 'Miguel', 'Torres', '+595987888888', null),
-    (9, 9012345, 3, 'Elena', 'Ruiz', null, 'elena@example.com'),
-    (10, 1123456, 8, 'Diego', 'Silva', '+595989101010', 'diego@example.com'),
-    (11, 2234567, 6, 'Carmen', 'Vega', '+595980111111', null),
-    (12, 3344568, 1, 'Hugo', 'Prieto', null, 'hugo@example.com')
+insert into clients (id, ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email) values
+    (1, 1234567, 9, 'María', 'González', null, 'Avda. Brasilia 111, Asunción', '+595981111111', 'maria@example.com'),
+    (2, 2345678, 7, 'Juan', 'Pérez', null, null, '+595982222222', null),
+    (3, 3456789, null, 'Ana', 'López', null, null, null, 'ana@example.com'),
+    (4, 4567890, 1, 'Pedro', 'Sosa', 'Sosa S.A.', 'Ruta 2 km 15, Capiatá', '+595983444444', 'pedro@example.com'),
+    (5, 5678901, 7, 'Lucía', 'Fernández', null, null, '+595984555555', null),
+    (6, 6789012, 1, 'Carlos', 'Giménez', null, null, null, 'carlos@example.com'),
+    (7, 7890123, 5, 'Rosa', 'Ayala', null, 'Calle Lomas 77, Luque', '+595986777777', 'rosa@example.com'),
+    (8, 8901234, 8, 'Miguel', 'Torres', null, null, '+595987888888', null),
+    (9, 9012345, 0, 'Elena', 'Ruiz', null, null, null, 'elena@example.com'),
+    (10, 1123456, 3, 'Diego', 'Silva', null, null, '+595989101010', 'diego@example.com'),
+    (11, 2234567, 1, 'Carmen', 'Vega', null, null, '+595980111111', null),
+    (12, 3344568, 0, 'Hugo', 'Prieto', null, null, null, 'hugo@example.com')
 on conflict (id) do update set
     ci = excluded.ci,
     verification_digit = excluded.verification_digit,
     first_name = excluded.first_name,
     last_name = excluded.last_name,
+    razon_social = excluded.razon_social,
+    domicilio = excluded.domicilio,
     phone_number = excluded.phone_number,
     email = excluded.email;
 
@@ -97,6 +104,11 @@ on conflict (id) do update set
 
 -- ============================================================
 -- Redeemable products (cost points_needed per unit redeemed)
+--
+-- Every product has an entry, so clients can redeem whichever product they
+-- want as long as their ledger balance covers it. Prizes (5, 6, 10-12)
+-- carry gift prices; everyday products (1-4, 7-9) redeem at earn-rate
+-- parity with their promotion_products.points_cost.
 -- ============================================================
 
 insert into redeemable_products (id, product_id, points_needed) values
@@ -105,7 +117,13 @@ insert into redeemable_products (id, product_id, points_needed) values
     (3, 3, 50),
     (4, 10, 150),
     (5, 11, 80),
-    (6, 12, 300)
+    (6, 12, 300),
+    (7, 1, 10),
+    (8, 2, 8),
+    (9, 4, 3),
+    (10, 7, 6),
+    (11, 8, 4),
+    (12, 9, 12)
 on conflict (id) do update set
     product_id = excluded.product_id,
     points_needed = excluded.points_needed;
@@ -122,40 +140,47 @@ select setval('redeemable_products_id_seq', (select max(id) from redeemable_prod
 -- partner 1 sells on invoices 001-001-xxxxxxxx, partner 2 on 002-001-xxxxxxxx
 -- (invoice numbers are unique per partner).
 --
---  id | partner | client | invoice         | lines                          | earned
---   1 |   1     |   1    | 001-001-0000001 | 2x Paracetamol (2x10)            | 25
---   2 |   1     |   2    | 001-001-0000002 | 1x Ibuprofeno (8) + 2x Crema (6) | 14
---   3 |   1     |   3    | 001-001-0000003 | 3x Alcohol (3x6)                 | 18
---   4 |   2     |   1    | 002-001-0000001 | 1x Protector (12)                | 12
---   5 |   1     |   4    | 001-001-0000004 | 2x Paracetamol (2x10)            | 20
---   6 |   2     |   5    | 002-001-0000002 | 5x Jabón (5x4)                   | 20
---   7 |   1     |   6    | 001-001-0000005 | 1x Termo Acero (no promo)        | 0
---   8 |   1     |   7    | 001-001-0000006 | 4x Vitamina C (4x5)              | 20
---   9 |   2     |   8    | 002-001-0000003 | 1x Paracet (10)+1x Ibupr (8)+1x Prot (12) | 30
---  10 |   1     |   9    | 001-001-0000007 | 2x Jabón (2x4)                   | 8
---  11 |   2     |  10    | 002-001-0000004 | 1x Crema (3)                     | 3
---  12 |   1     |  11    | 001-001-0000008 | 6x Alcohol (6x6)                 | 36
+-- The three Paraguayan fiscal realities are all represented:
+-- * ticket 1: electronic (number + timbrado + CDC, SIFEN);
+-- * ticket 2: timbrado paper (number + timbrado);
+-- * tickets 3-12: pre-printed paper (number only).
+--
+--  id | partner | client | invoice         | fiscal      | lines                          | earned
+--   1 |   1     |   1    | 001-001-0000001 | electronic  | 2x Paracetamol (2x10)            | 25
+--   2 |   1     |   2    | 001-001-0000002 | timbrado    | 1x Ibuprofeno (8) + 2x Crema (6) | 14
+--   3 |   1     |   3    | 001-001-0000003 | paper       | 3x Alcohol (3x6)                 | 18
+--   4 |   2     |   1    | 002-001-0000001 | paper       | 1x Protector (12)                | 12
+--   5 |   1     |   4    | 001-001-0000004 | paper       | 2x Paracetamol (2x10)            | 20
+--   6 |   2     |   5    | 002-001-0000002 | paper       | 5x Jabón (5x4)                   | 20
+--   7 |   1     |   6    | 001-001-0000005 | paper       | 1x Termo Acero (no promo)        | 0
+--   8 |   1     |   7    | 001-001-0000006 | paper       | 4x Vitamina C (4x5)              | 20
+--   9 |   2     |   8    | 002-001-0000003 | paper       | 1x Paracet (10)+1x Ibupr (8)+1x Prot (12) | 30
+--  10 |   1     |   9    | 001-001-0000007 | paper       | 2x Jabón (2x4)                   | 8
+--  11 |   2     |  10    | 002-001-0000004 | paper       | 1x Crema (3)                     | 3
+--  12 |   1     |  11    | 001-001-0000008 | paper       | 6x Alcohol (6x6)                 | 36
 --
 -- Ticket 7 earns nothing (Termo Acero is redeemable-only), so it posts no
 -- ledger row — mirroring what POST /api/v1/partners/tickets does.
+-- Ticket 1 CDC (partner 1 RUC 80012345-0, 001-001-0000001, 2026-01-01):
+--   01800123450001001000000122026010110000000012
 -- Only inserted when each ticket id does not exist yet.
 -- ============================================================
 
-insert into tickets (id, ticket_id, partner_id, client_id)
+insert into tickets (id, ticket_id, timbrado, cdc, partner_id, client_id)
 select * from (values
-    (1, '001-001-0000001', 1, 1),
-    (2, '001-001-0000002', 1, 2),
-    (3, '001-001-0000003', 1, 3),
-    (4, '002-001-0000001', 2, 1),
-    (5, '001-001-0000004', 1, 4),
-    (6, '002-001-0000002', 2, 5),
-    (7, '001-001-0000005', 1, 6),
-    (8, '001-001-0000006', 1, 7),
-    (9, '002-001-0000003', 2, 8),
-    (10, '001-001-0000007', 1, 9),
-    (11, '002-001-0000004', 2, 10),
-    (12, '001-001-0000008', 1, 11)
-) as v(id, ticket_id, partner_id, client_id)
+    (1, '001-001-0000001', '12345678', '01800123450001001000000122026010110000000012', 1, 1),
+    (2, '001-001-0000002', '12345678', null, 1, 2),
+    (3, '001-001-0000003', null, null, 1, 3),
+    (4, '002-001-0000001', null, null, 2, 1),
+    (5, '001-001-0000004', null, null, 1, 4),
+    (6, '002-001-0000002', null, null, 2, 5),
+    (7, '001-001-0000005', null, null, 1, 6),
+    (8, '001-001-0000006', null, null, 1, 7),
+    (9, '002-001-0000003', null, null, 2, 8),
+    (10, '001-001-0000007', null, null, 1, 9),
+    (11, '002-001-0000004', null, null, 2, 10),
+    (12, '001-001-0000008', null, null, 1, 11)
+) as v(id, ticket_id, timbrado, cdc, partner_id, client_id)
 where not exists (select 1 from tickets t where t.id = v.id);
 
 insert into ticket_details (ticket_id, product_id, quantity) values

@@ -11,7 +11,9 @@
 //! Tokens are HS256-signed with the `LAB_JWT_SECRET` environment secret via
 //! [`create_token`] and checked with [`validate_token`]. Authentication and
 //! actor scoping live in the middleware layers [`partner_auth`] (pharmacy
-//! routes) and [`client_auth`] (customer routes): each validates the bearer
+//! routes), [`client_auth`] (customer API routes) and [`client_page_auth`]
+//! (server-rendered client pages, which redirect browser navigations to the
+//! login page instead of answering `401` JSON): each validates the bearer
 //! token and additionally checks the token actor matches the targeted
 //! resource, so handlers never see a mismatched actor.
 //!
@@ -25,7 +27,7 @@ use axum::{
     extract::{Request, State},
     http::{StatusCode, header},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -380,4 +382,204 @@ pub async fn client_auth(req: Request, next: Next) -> Result<Response, AuthError
         return Err(forbidden("forbidden client"));
     }
     Ok(next.run(req).await)
+}
+
+/// Cookie carrying the client JWT for browser page navigations (`GET
+/// `/clients/{client_id}/redeem`). Set by `POST
+/// /api/v1/clients/otp/verify` (`Set-Cookie`) alongside the JSON token body
+/// the redeem page keeps in `localStorage` for API calls; both hold the same
+/// 1-hour token and either one satisfies [`client_page_auth`].
+pub const CLIENT_SESSION_COOKIE: &str = "lab_client_token";
+
+/// Extracts the client JWT from a page request: the `Authorization: Bearer`
+/// header first, then the [`CLIENT_SESSION_COOKIE`] cookie browsers send
+/// automatically on navigation (plain page `GET`s carry no `Authorization`
+/// header because the token lives in `localStorage`).
+fn page_bearer_token(req: &Request) -> Option<String> {
+    if let Some(token) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+    {
+        return Some(token.to_string());
+    }
+    let prefix = format!("{CLIENT_SESSION_COOKIE}=");
+    req.headers()
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.strip_prefix(&prefix))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+/// Builds a `303 See Other` redirect to the client login page, preserving the
+/// intercepted path in `?next=` so the login page can send the client back
+/// after verifying.
+fn login_redirect(path: &str) -> Response {
+    let mut headers = header::HeaderMap::new();
+    let location = format!("/clients/login?next={path}");
+    let location: header::HeaderValue = location
+        .parse()
+        .unwrap_or_else(|_| header::HeaderValue::from_static("/clients/login"));
+    headers.insert(header::LOCATION, location);
+    (StatusCode::SEE_OTHER, headers, "").into_response()
+}
+
+/// Axum middleware for the server-rendered client pages: same-client bearer
+/// auth, with a login redirect for browser navigations.
+///
+/// The token comes from the `Authorization` header or the
+/// [`CLIENT_SESSION_COOKIE`] cookie, and must be a [`Claims::Client`] whose
+/// id matches the `/clients/{client_id}/redeem` path. Authenticated requests
+/// pass through; unauthenticated `GET` navigations get `303 See Other` to
+/// `/clients/login?next=<path>`, while non-`GET` requests without auth get a
+/// `401` JSON body (same shape as the API).
+pub async fn client_page_auth(req: Request, next: Next) -> Response {
+    let target: Option<i32> = req
+        .uri()
+        .path()
+        .strip_prefix("/clients/")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|segment| segment.parse().ok());
+    let authorized = page_bearer_token(&req)
+        .and_then(|token| validate_token(&token).ok())
+        .and_then(|claims| ClientClaims::try_from(claims).ok())
+        .is_some_and(|claims| target == Some(claims.client_id()));
+    if authorized {
+        return next.run(req).await;
+    }
+    tracing::warn!("client_page_auth: rejected (unauthenticated page view)");
+    if req.method() == axum::http::Method::GET {
+        return login_redirect(req.uri().path());
+    }
+    unauthorized("missing token").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, body::Body, middleware, routing::get};
+    use tower::ServiceExt as _;
+
+    /// Stub app mirroring the frontend wiring: one page route behind
+    /// [`client_page_auth`], with a stub handler so accept-path tests never
+    /// touch the database.
+    fn test_app() -> Router {
+        Router::new()
+            .route("/clients/{client_id}/redeem", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn(client_page_auth))
+    }
+
+    /// Mints a 1-hour client JWT with `LAB_JWT_SECRET=test-secret`.
+    fn client_token(client_id: i32) -> String {
+        unsafe { std::env::set_var("LAB_JWT_SECRET", "test-secret") };
+        create_token(
+            ClientClaims::new(client_id, 12_345, Utc::now() + chrono::Duration::hours(1)).into(),
+        )
+        .unwrap()
+    }
+
+    /// Mints an 8-hour partner JWT with `LAB_JWT_SECRET=test-secret`.
+    fn partner_token() -> String {
+        unsafe { std::env::set_var("LAB_JWT_SECRET", "test-secret") };
+        create_token(PartnerClaims::new(1, Utc::now() + chrono::Duration::hours(8)).into()).unwrap()
+    }
+
+    /// Sends a `GET` page request through the stub app.
+    async fn get_page(app: Router, uri: &str, headers: &[(&str, String)]) -> Response {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, value.clone());
+        }
+        app.oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Unauthenticated page views bounce to the login page with `?next=`.
+    #[tokio::test]
+    async fn redirects_unauthenticated_get_to_login() {
+        let res = get_page(test_app(), "/clients/1/redeem", &[]).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            res.headers().get(header::LOCATION).unwrap(),
+            "/clients/login?next=/clients/1/redeem"
+        );
+    }
+
+    /// Garbage cookies bounce just like missing ones.
+    #[tokio::test]
+    async fn rejects_garbage_cookie() {
+        let res = get_page(
+            test_app(),
+            "/clients/1/redeem",
+            &[(
+                header::COOKIE.as_str(),
+                "lab_client_token=garbage".to_string(),
+            )],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// A client token for another id bounces (same-client scoping).
+    #[tokio::test]
+    async fn rejects_scope_mismatch() {
+        let cookie = format!("lab_client_token={}", client_token(2));
+        let res = get_page(
+            test_app(),
+            "/clients/1/redeem",
+            &[(header::COOKIE.as_str(), cookie)],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            res.headers().get(header::LOCATION).unwrap(),
+            "/clients/login?next=/clients/1/redeem"
+        );
+    }
+
+    /// Partner tokens do not open client pages.
+    #[tokio::test]
+    async fn rejects_partner_token() {
+        let cookie = format!("lab_client_token={}", partner_token());
+        let res = get_page(
+            test_app(),
+            "/clients/1/redeem",
+            &[(header::COOKIE.as_str(), cookie)],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// A matching session cookie renders the page.
+    #[tokio::test]
+    async fn passes_matching_cookie() {
+        let cookie = format!("lab_client_token={}", client_token(1));
+        let res = get_page(
+            test_app(),
+            "/clients/1/redeem",
+            &[(header::COOKIE.as_str(), cookie)],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// The `Authorization` header transport works without any cookie.
+    #[tokio::test]
+    async fn passes_bearer_header() {
+        let auth = format!("Bearer {}", client_token(1));
+        let res = get_page(
+            test_app(),
+            "/clients/1/redeem",
+            &[(header::AUTHORIZATION.as_str(), auth)],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
 }

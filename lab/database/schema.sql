@@ -22,9 +22,13 @@
 create table partners (
     id serial not null primary key,
     name varchar(32) not null,
-    ruc varchar(32) not null unique,
+    ruc varchar(32) not null unique check (ruc ~ '^[0-9]{1,8}-[0-9]$'),
     psk_hash text not null,
-    is_active boolean not null default true
+    is_active boolean not null default true,
+    -- Emisor fiscal (factura PY): razón social = name, domicilio y actividad
+    -- económica impresos en la factura.
+    domicilio varchar(128) not null default 'N/A',
+    actividad_economica varchar(64) not null default 'N/A'
 );
 
 -- ============================================================
@@ -40,6 +44,16 @@ create table clients (
     ),
     first_name varchar(32) not null,
     last_name varchar(32) not null,
+    -- Receptor fiscal (factura PY): las personas físicas usan
+    -- first_name/last_name + CI; las personas jurídicas usan razon_social +
+    -- RUC (ci + verification_digit). Al menos una forma de nombrar es
+    -- obligatoria; el domicilio es lo impreso en la factura.
+    razon_social varchar(64) null check (
+        razon_social is null or length(razon_social) > 0
+    ),
+    domicilio varchar(128) null check (
+        domicilio is null or length(domicilio) > 0
+    ),
     phone_number varchar(13) null check (
         email is not null or phone_number is not null
     ),
@@ -73,16 +87,26 @@ create table redeemable_products (
 );
 
 -- ============================================================
--- Invoices / Tickets
--- ============================================================
-
+-- Invoices / Tickets (factura PY: NRO + timbrado + CDC).
+--
+-- Three fiscal realities, all supported (see src/fiscal.rs):
+-- * paper:          ticket_id only.
+-- * timbrado paper: ticket_id + timbrado.
+-- * electronic:     ticket_id + timbrado + cdc (SIFEN).
+-- Prices, IVA, sale condition and totals are intentionally NOT stored: they
+-- are irrelevant for the loyalty-points domain.
 create table tickets (
     id serial not null primary key,
-    ticket_id varchar(64) not null,
+    ticket_id varchar(64) not null check (
+        ticket_id ~ '^[0-9]{3}-[0-9]{3}-[0-9]{7}$'
+    ),
+    timbrado char(8) null check (timbrado ~ '^[0-9]{8}$'),
+    cdc char(44) null unique check (cdc ~ '^[0-9]{44}$'),
     date timestamptz not null default current_timestamp,
     partner_id int not null references partners(id),
     client_id int not null references clients(id),
-    unique (partner_id, ticket_id)
+    unique (partner_id, ticket_id),
+    check (cdc is null or timbrado is not null)
 );
 
 create table ticket_details (

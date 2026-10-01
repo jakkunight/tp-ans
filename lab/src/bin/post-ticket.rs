@@ -41,13 +41,19 @@ struct TicketDetail {
 struct TicketClient {
     /// `clients.ci` (unique) lookup key.
     ci: i32,
-    /// Optional `<ci>-<digit>` RUC suffix digit; omitted when absent.
+    /// Optional `<ci>-<digit>` RUC check digit (mod-11 must match `ci`).
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_digit: Option<i32>,
     /// Buyer first name as printed on the factura.
     first_name: String,
     /// Buyer last name as printed on the factura.
     last_name: String,
+    /// Company name for juridical receptors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    razon_social: Option<String>,
+    /// Receptor address printed on the factura.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domicilio: Option<String>,
     /// SMS channel for OTP codes; omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     phone_number: Option<String>,
@@ -57,12 +63,22 @@ struct TicketClient {
 }
 
 /// Body for `POST /api/v1/partners/tickets`.
+///
+/// Fiscal identity: paper sends only `ticket_id` (`EEE-PPP-NNNNNNN`);
+/// timbrado paper adds `timbrado` (8 digits); electronic adds `timbrado` +
+/// `cdc` (44 digits).
 #[derive(Debug, Clone, Serialize)]
 struct CreateTicketRequest {
     /// `partners.id` of the issuing pharmacy.
     partner_id: i32,
-    /// Invoice number from the factura (unique per partner).
+    /// Printed invoice number `EEE-PPP-NNNNNNN` (unique per partner).
     ticket_id: String,
+    /// 8-digit DNIT timbrado (timbrado paper + electronic only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timbrado: Option<String>,
+    /// 44-digit SIFEN CDC (electronic only; requires `timbrado`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cdc: Option<String>,
     /// Buyer data; registered on the fly when the CI is unknown.
     client: TicketClient,
     /// At least one product line.
@@ -118,8 +134,16 @@ struct Args {
     last_name: Option<String>,
     /// `--verification-digit`: optional RUC suffix digit.
     verification_digit: Option<String>,
-    /// `--ticket-id`: invoice number from the factura.
+    /// `--ticket-id`: printed invoice number EEE-PPP-NNNNNNN.
     ticket_id: Option<String>,
+    /// `--timbrado`: 8-digit DNIT authorization (timbrado + electronic).
+    timbrado: Option<String>,
+    /// `--cdc`: 44-digit SIFEN CDC (electronic only).
+    cdc: Option<String>,
+    /// `--razon-social`: company name for juridical receptors.
+    razon_social: Option<String>,
+    /// `--domicilio`: receptor address printed on the factura.
+    domicilio: Option<String>,
     /// `--phone`: buyer SMS channel (for new clients).
     phone: Option<String>,
     /// `--email`: buyer email channel (for new clients).
@@ -158,13 +182,18 @@ Usage (interactive TUI):
 
 Options:
   --partner ID     Partner (farmacia) id. Required unless --delete/--login-partner alone.
-  --ticket-id NRO  Invoice number from the factura (unique per partner). Required to post.
+  --ticket-id NRO  Printed invoice number EEE-PPP-NNNNNNN (unique per partner).
+                   Required to post. Example: 001-001-0000009
+  --timbrado T     8-digit DNIT timbrado (timbrado paper + electronic only).
+  --cdc CDC        44-digit SIFEN CDC (electronic only; requires --timbrado).
   --ci CI          Buyer CI from the factura (client is registered if new).
                    Required unless --delete/--login-partner alone.
   --first-name N   Buyer first name as printed on the factura. Required unless --delete/--login-partner alone.
   --last-name N    Buyer last name as printed on the factura. Required unless --delete/--login-partner alone.
   --verification-digit D
-                   Optional <CI>-<D> RUC suffix digit (0-9).
+                   Optional <CI>-<D> RUC check digit (0-9, mod-11 must match CI).
+  --razon-social R Company name for juridical receptors (optional).
+  --domicilio DIR  Receptor address printed on the factura (optional).
   --phone NUM      Buyer phone (SMS channel for OTP). New clients need --phone and/or --email.
   --email ADDR     Buyer email (channel for OTP). New clients need --phone and/or --email.
   --login-partner RUC
@@ -193,12 +222,13 @@ TUI keys:
   Ctrl+D             Void ticket           Esc / Ctrl+C     Quit
 
 Seed data (lab/database/seed.sql):
-  Partners: 1 Farmacia Central (RUC 80012345-1), 2 Farmacia del Sur (RUC 80067890-2)
+  Partners: 1 Farmacia Central (RUC 80012345-0), 2 Farmacia del Sur (RUC 80067890-7)
   Clients:  12 clientes (1 María González CI 1234567, 2 Juan Pérez CI 2345678, ...)
   Products: 12 (1 Paracetamol 10 pts, 2 Ibuprofeno 8 pts, 3 Vitamina C 5 pts,
             4 Crema 3 pts, 7 Alcohol 6 pts, 8 Jabón 4 pts, 9 Protector 12 pts;
-            canje: 5 Termo 100 pts, 6 Mochila 250 pts, 3 Vitamina 50 pts,
-            10 Termo Dep. 150 pts, 11 Gorra 80 pts, 12 Kit 300 pts)
+            canje (todos con precio): 1 Paracet 10, 2 Ibupr 8, 3 Vitam 50,
+            4 Crema 3, 5 Termo 100, 6 Mochila 250, 7 Alcohol 6, 8 Jabón 4,
+            9 Protector 12, 10 Termo Dep. 150, 11 Gorra 80, 12 Kit 300)
   Tickets:  12 demo (partner 1: 001-001-0000001..08, partner 2: 002-001-0000001..04)
 "#;
 
@@ -220,6 +250,12 @@ fn parse_args() -> Result<Args> {
                     Some(it.next().context("--verification-digit needs a value")?)
             }
             "--ticket-id" => args.ticket_id = Some(it.next().context("--ticket-id needs a value")?),
+            "--timbrado" => args.timbrado = Some(it.next().context("--timbrado needs a value")?),
+            "--cdc" => args.cdc = Some(it.next().context("--cdc needs a value")?),
+            "--razon-social" => {
+                args.razon_social = Some(it.next().context("--razon-social needs a value")?)
+            }
+            "--domicilio" => args.domicilio = Some(it.next().context("--domicilio needs a value")?),
             "--phone" => args.phone = Some(it.next().context("--phone needs a value")?),
             "--email" => args.email = Some(it.next().context("--email needs a value")?),
             "--reason" => args.reason = Some(it.next().context("--reason needs a value")?),
@@ -325,12 +361,14 @@ fn non_empty_str(raw: &str, what: &str) -> Result<String> {
 }
 
 /// Builds the ticket buyer from raw flag/field values, validating CI, names
-/// and the optional verification digit. Blank contacts become `None`.
+/// and the optional verification digit. Blank optionals become `None`.
 fn build_client(
     ci: Option<&str>,
     first_name: Option<&str>,
     last_name: Option<&str>,
     verification_digit: Option<&str>,
+    razon_social: Option<&str>,
+    domicilio: Option<&str>,
     phone: Option<&str>,
     email: Option<&str>,
 ) -> Result<TicketClient> {
@@ -344,6 +382,8 @@ fn build_client(
         verification_digit: verification_digit.map(parse_vdigit).transpose()?,
         first_name: non_empty(first_name, "--first-name")?,
         last_name: non_empty(last_name, "--last-name")?,
+        razon_social: contact(razon_social),
+        domicilio: contact(domicilio),
         phone_number: contact(phone),
         email: contact(email),
     })
@@ -554,13 +594,23 @@ async fn run_oneshot(args: &Args) -> Result<()> {
         args.first_name.as_deref(),
         args.last_name.as_deref(),
         args.verification_digit.as_deref(),
+        args.razon_social.as_deref(),
+        args.domicilio.as_deref(),
         args.phone.as_deref(),
         args.email.as_deref(),
     )?;
     let details = parse_items(&args.items)?;
+    let blank = |raw: &Option<String>| {
+        raw.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     let req = CreateTicketRequest {
         partner_id,
         ticket_id: non_empty(args.ticket_id.as_deref(), "--ticket-id")?,
+        timbrado: blank(&args.timbrado),
+        cdc: blank(&args.cdc),
         client,
         details,
     };
@@ -608,12 +658,20 @@ const FIELD_VDIGIT: usize = 9;
 const FIELD_PHONE: usize = 10;
 /// Buyer email (OTP channel) text field.
 const FIELD_EMAIL: usize = 11;
+/// Buyer razon social (juridical receptor) text field.
+const FIELD_RAZON: usize = 12;
+/// Buyer domicilio text field.
+const FIELD_DOMICILIO: usize = 13;
+/// Fiscal timbrado (8 digits) text field.
+const FIELD_TIMBRADO: usize = 14;
+/// Fiscal CDC (44 digits) text field.
+const FIELD_CDC: usize = 15;
 /// Ticket id to void text field.
-const FIELD_DELETE: usize = 12;
+const FIELD_DELETE: usize = 16;
 /// Void reason text field.
-const FIELD_REASON: usize = 13;
+const FIELD_REASON: usize = 17;
 /// Number of fixed text fields.
-const TEXT_FIELDS: usize = 14;
+const TEXT_FIELDS: usize = 18;
 
 // Collapsible sections.
 /// Connection section: base URL + token.
@@ -712,6 +770,10 @@ impl App {
             args.verification_digit.clone().unwrap_or_default(),
             args.phone.clone().unwrap_or_default(),
             args.email.clone().unwrap_or_default(),
+            args.razon_social.clone().unwrap_or_default(),
+            args.domicilio.clone().unwrap_or_default(),
+            args.timbrado.clone().unwrap_or_default(),
+            args.cdc.clone().unwrap_or_default(),
             args.delete.clone().unwrap_or_default(),
             args.reason.clone().unwrap_or_default(),
         ];
@@ -752,10 +814,14 @@ impl App {
                     SEC_TICKET => {
                         v.push(Focus::Field(FIELD_PARTNER));
                         v.push(Focus::Field(FIELD_TICKET_NO));
+                        v.push(Focus::Field(FIELD_TIMBRADO));
+                        v.push(Focus::Field(FIELD_CDC));
                         v.push(Focus::Field(FIELD_CI));
                         v.push(Focus::Field(FIELD_FIRST));
                         v.push(Focus::Field(FIELD_LAST));
                         v.push(Focus::Field(FIELD_VDIGIT));
+                        v.push(Focus::Field(FIELD_RAZON));
+                        v.push(Focus::Field(FIELD_DOMICILIO));
                         v.push(Focus::Field(FIELD_PHONE));
                         v.push(Focus::Field(FIELD_EMAIL));
                     }
@@ -796,10 +862,14 @@ impl App {
                     SEC_TICKET => {
                         r.push(RowKind::Field(FIELD_PARTNER));
                         r.push(RowKind::Field(FIELD_TICKET_NO));
+                        r.push(RowKind::Field(FIELD_TIMBRADO));
+                        r.push(RowKind::Field(FIELD_CDC));
                         r.push(RowKind::Field(FIELD_CI));
                         r.push(RowKind::Field(FIELD_FIRST));
                         r.push(RowKind::Field(FIELD_LAST));
                         r.push(RowKind::Field(FIELD_VDIGIT));
+                        r.push(RowKind::Field(FIELD_RAZON));
+                        r.push(RowKind::Field(FIELD_DOMICILIO));
                         r.push(RowKind::Field(FIELD_PHONE));
                         r.push(RowKind::Field(FIELD_EMAIL));
                     }
@@ -993,6 +1063,8 @@ impl App {
         let req = CreateTicketRequest {
             partner_id: parse_id(self.fields[FIELD_PARTNER].trim(), "partner id")?,
             ticket_id: non_empty_str(self.fields[FIELD_TICKET_NO].trim(), "nro. factura")?,
+            timbrado: contact(FIELD_TIMBRADO),
+            cdc: contact(FIELD_CDC),
             client: build_client(
                 Some(&self.fields[FIELD_CI]),
                 Some(&self.fields[FIELD_FIRST]),
@@ -1002,6 +1074,8 @@ impl App {
                 } else {
                     Some(self.fields[FIELD_VDIGIT].as_str())
                 },
+                contact(FIELD_RAZON).as_deref(),
+                contact(FIELD_DOMICILIO).as_deref(),
                 contact(FIELD_PHONE).as_deref(),
                 contact(FIELD_EMAIL).as_deref(),
             )?,
@@ -1060,13 +1134,17 @@ const FIELD_TITLES: [&str; TEXT_FIELDS] = [
     "Login RUC (partner)",
     "Login PSK (required)",
     "Partner ID",
-    "Nro. factura (ticket_id)",
+    "Nro. factura EEE-PPP-NNNNNNN",
     "Client CI (de la factura)",
     "Client first name",
     "Client last name",
-    "Verif. digit (optional)",
+    "Verif. digit (optional, mod-11)",
     "Phone (SMS OTP, optional)",
     "Email (OTP, optional)",
+    "Razon social (optional)",
+    "Domicilio (optional)",
+    "Timbrado 8 digitos (optional)",
+    "CDC 44 digitos (optional)",
     "Ticket ID (para anular)",
     "Motivo (para anular)",
 ];
@@ -1418,7 +1496,7 @@ mod tests {
         let full_rows = app.rows().len();
         assert!(full_focus > 5 && full_rows > 5);
 
-        // Collapse the ticket section: its 8 fields vanish from focus/rows.
+        // Collapse the ticket section: its 12 fields vanish from focus/rows.
         app.focus = app
             .focusables()
             .iter()
@@ -1426,8 +1504,8 @@ mod tests {
             .unwrap();
         app.toggle_section();
         assert!(app.collapsed[SEC_TICKET]);
-        assert_eq!(app.focusables().len(), full_focus - 8);
-        assert_eq!(app.rows().len(), full_rows - 8);
+        assert_eq!(app.focusables().len(), full_focus - 12);
+        assert_eq!(app.rows().len(), full_rows - 12);
         assert_eq!(app.focus_item(), Focus::Section(SEC_TICKET));
 
         app.toggle_section();

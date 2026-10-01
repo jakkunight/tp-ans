@@ -107,21 +107,29 @@ pub struct TicketDetailDto {
 ///
 /// The pharmacy submits the buyer data as it appears on the factura. The
 /// client is looked up by `ci` (unique) and registered on the fly when
-/// unknown. The government-issued `verification_digit` (`<ci>-<digit>` RUC
-/// suffix) is optional and never required. A new client needs at least one
-/// contact (`phone_number` and/or `email`): the `clients` table requires a
-/// reachable OTP channel.
+/// unknown. `verification_digit` is the RUC DV (`<ci>-<digit>`): when present
+/// its mod-11 must match `ci` (see `crate::fiscal::Ruc`). Personas físicas
+/// use `first_name`/`last_name`; personas jurídicas additionally send
+/// `razon_social`. `domicilio` is the receptor address printed on the
+/// factura. A new client needs at least one contact (`phone_number` and/or
+/// `email`): the `clients` table requires a reachable OTP channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TicketClientDto {
     /// `clients.ci` (unique): the lookup key for find-or-create.
     pub ci: i32,
-    /// Optional `<ci>-<digit>` RUC suffix digit (`0-9`).
+    /// RUC check digit (`0-9`); when present, must be the mod-11 DV of `ci`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_digit: Option<i32>,
     /// Buyer first name as printed on the factura.
     pub first_name: String,
     /// Buyer last name as printed on the factura.
     pub last_name: String,
+    /// Company name for juridical receptors (`varchar(64)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub razon_social: Option<String>,
+    /// Receptor address as printed on the factura (`varchar(128)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domicilio: Option<String>,
     /// SMS channel for the client (required for new clients without email).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone_number: Option<String>,
@@ -133,16 +141,28 @@ pub struct TicketClientDto {
 /// `POST /api/v1/partners/tickets`
 ///
 /// Creates a ticket issued by `partner_id` for the invoice `ticket_id`
-/// (the factura number, unique per partner), registering the buyer from the
-/// ticket data when needed. `date` defaults to `current_timestamp`
-/// server-side, so it is not part of the request.
+/// (printed number `EEE-PPP-NNNNNNN`, unique per partner), registering the
+/// buyer from the ticket data when needed. `date` defaults to
+/// `current_timestamp` server-side, so it is not part of the request.
+///
+/// Fiscal identity follows `crate::fiscal`: paper invoices send only
+/// `ticket_id`; timbrado paper adds `timbrado` (8 digits); electronic
+/// (SIFEN) invoices add both `timbrado` and `cdc` (44 digits). `cdc`
+/// without `timbrado` is rejected, and an electronic CDC must embed the
+/// same number and the partner RUC (checked in `crate::db::create_ticket`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateTicketRequest {
     /// `partners.id` of the issuing pharmacy (must be active; must match the
     /// JWT actor).
     pub partner_id: i32,
-    /// Invoice number from the factura (`varchar(64)`, unique per partner).
+    /// Printed invoice number `EEE-PPP-NNNNNNN` (unique per partner).
     pub ticket_id: String,
+    /// 8-digit DNIT timbrado (timbrado paper + electronic only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timbrado: Option<String>,
+    /// 44-digit SIFEN CDC (electronic invoices only; requires `timbrado`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdc: Option<String>,
     /// Buyer identity from the factura; registered when unknown.
     pub client: TicketClientDto,
     /// At least one product line.
@@ -196,20 +216,27 @@ pub struct DeleteTicketResponse {
 /// Public client profile.
 ///
 /// Mirrors the `clients` table (`id`, `ci`, `verification_digit`,
-/// `first_name`, `last_name`, `phone_number`, `email`). Contacts are the
-/// OTP channels, so they are visible to the profile owner.
+/// `first_name`, `last_name`, `razon_social`, `domicilio`, `phone_number`,
+/// `email`). Contacts are the OTP channels, so they are visible to the
+/// profile owner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClientInfoDto {
     /// `clients.id` primary key.
     pub id: i32,
-    /// `clients.ci` national id (unique).
+    /// `clients.ci` national id / RUC base (unique).
     pub ci: i32,
-    /// Optional `<ci>-<digit>` RUC suffix digit.
+    /// RUC check digit (`<ci>-<digit>`), when the receptor bills with RUC.
     pub verification_digit: Option<i32>,
     /// `clients.first_name`.
     pub first_name: String,
     /// `clients.last_name`.
     pub last_name: String,
+    /// `clients.razon_social` company name, if a juridical receptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub razon_social: Option<String>,
+    /// `clients.domicilio` fiscal address, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domicilio: Option<String>,
     /// `clients.phone_number` (SMS channel), if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone_number: Option<String>,
@@ -219,12 +246,22 @@ pub struct ClientInfoDto {
 }
 
 /// Full ticket view embedded in the client dashboard.
+///
+/// `ticket_number` is the printed `EEE-PPP-NNNNNNN`; `timbrado`/`cdc` carry
+/// the fiscal authorization when the invoice has one (paper invoices leave
+/// both absent).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TicketDto {
     /// `tickets.id` primary key (internal id, not the invoice number).
     pub id: i32,
-    /// Invoice number from the factura (`tickets.ticket_id`).
+    /// Printed invoice number `EEE-PPP-NNNNNNN` (`tickets.ticket_id`).
     pub ticket_number: String,
+    /// 8-digit DNIT timbrado (`tickets.timbrado`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timbrado: Option<String>,
+    /// 44-digit SIFEN CDC (`tickets.cdc`), if electronic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdc: Option<String>,
     /// `tickets.date` issue timestamp.
     pub date: DateTime<Utc>,
     /// `partners.id` of the issuing pharmacy.

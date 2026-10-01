@@ -498,6 +498,8 @@ mod tests {
             verification_digit: None,
             first_name: "Test".to_string(),
             last_name: "User".to_string(),
+            razon_social: None,
+            domicilio: None,
             phone_number: Some("+595981000000".to_string()),
             email: Some("test@example.com".to_string()),
         }

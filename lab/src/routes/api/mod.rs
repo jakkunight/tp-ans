@@ -39,8 +39,9 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     middleware,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use chrono::{Duration, Utc};
@@ -48,7 +49,9 @@ use chrono::{Duration, Utc};
 use crate::{
     AppState,
     db::{self, DbError, NewClient, NewTicket, RedeemLine, TicketLine},
-    jwt::{ClientClaims, PartnerClaims, client_auth, create_token, partner_auth},
+    jwt::{
+        CLIENT_SESSION_COOKIE, ClientClaims, PartnerClaims, client_auth, create_token, partner_auth,
+    },
     otp::{self, OtpChannel, OtpError},
 };
 
@@ -144,20 +147,24 @@ pub fn create_api(state: &Arc<AppState>) -> anyhow::Result<Router<Arc<AppState>>
 
 /// Validates buyer fields shared by ticket creation.
 ///
-/// Returns trimmed `(first_name, last_name)`.
+/// Returns trimmed `(first_name, last_name, razon_social, domicilio)`.
 ///
 /// # Errors
 ///
-/// Returns `400` for invalid CI, names, verification digit or contacts.
+/// Returns `400` for invalid CI, names, verification digit (range + mod-11
+/// RUC check), razon social, domicilio or contacts.
 fn validate_buyer(
     ci: i32,
     verification_digit: Option<i32>,
     first_name: &str,
     last_name: &str,
+    razon_social: Option<&str>,
+    domicilio: Option<&str>,
     phone_number: Option<&str>,
     email: Option<&str>,
-) -> Result<(String, String), ApiError> {
+) -> Result<(String, String, Option<String>, Option<String>), ApiError> {
     // Values are not logged: CI, names and contacts are sensitive.
+    use crate::fiscal::Ruc;
     if ci < 0 {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid buyer ci"));
     }
@@ -169,14 +176,54 @@ fn validate_buyer(
     if first_name.len() > 32 || last_name.len() > 32 {
         return Err(api_error(StatusCode::BAD_REQUEST, "buyer name too long"));
     }
-    if let Some(vd) = verification_digit
-        && !(0..=9).contains(&vd)
-    {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid verification digit",
-        ));
+    if let Some(vd) = verification_digit {
+        if !(0..=9).contains(&vd) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid verification digit",
+            ));
+        }
+        // `<ci>-<digit>` must be a valid RUC (DNIT mod-11).
+        let candidate = format!("{ci}-{vd}");
+        if Ruc::parse(&candidate).is_err() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid verification digit",
+            ));
+        }
     }
+    let razon_social = match razon_social {
+        None => None,
+        Some(raw) => {
+            let t = raw.trim().to_string();
+            if t.is_empty() {
+                None
+            } else if t.len() > 64 {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "buyer razon social too long",
+                ));
+            } else {
+                Some(t)
+            }
+        }
+    };
+    let domicilio = match domicilio {
+        None => None,
+        Some(raw) => {
+            let t = raw.trim().to_string();
+            if t.is_empty() {
+                None
+            } else if t.len() > 128 {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "buyer domicilio too long",
+                ));
+            } else {
+                Some(t)
+            }
+        }
+    };
     if let Some(phone) = phone_number {
         // `varchar(13)`: e.g. `+595981123456`.
         if phone.trim().is_empty() || phone.len() > 13 {
@@ -188,7 +235,65 @@ fn validate_buyer(
     {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid buyer contact"));
     }
-    Ok((first_name, last_name))
+    Ok((first_name, last_name, razon_social, domicilio))
+}
+
+/// Validates the fiscal identity of a ticket (number + timbrado + CDC).
+///
+/// Returns trimmed `(ticket_number, timbrado, cdc)` with empty optionals
+/// normalized to `None`.
+///
+/// # Errors
+///
+/// Returns `400` for a malformed number/timbrado/CDC, a CDC check-digit
+/// mismatch, or a CDC without timbrado.
+fn validate_fiscal(
+    ticket_id: &str,
+    timbrado: Option<&str>,
+    cdc: Option<&str>,
+) -> Result<(String, Option<String>, Option<String>), ApiError> {
+    use crate::fiscal::{Cdc, FiscalDocumentKind, InvoiceNumber, Timbrado};
+    let number = InvoiceNumber::parse(ticket_id).map_err(|_| {
+        tracing::warn!("add_ticket: rejected (invalid ticket number)");
+        api_error(StatusCode::BAD_REQUEST, "invalid ticket number")
+    })?;
+    let timbrado_norm = timbrado
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let cdc_norm = cdc
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(ref t) = timbrado_norm {
+        Timbrado::parse(t).map_err(|_| {
+            tracing::warn!("add_ticket: rejected (invalid timbrado)");
+            api_error(StatusCode::BAD_REQUEST, "invalid timbrado")
+        })?;
+    }
+    if let Some(ref c) = cdc_norm {
+        Cdc::parse(c).map_err(|_| {
+            tracing::warn!("add_ticket: rejected (invalid cdc)");
+            api_error(StatusCode::BAD_REQUEST, "invalid cdc")
+        })?;
+    }
+    if FiscalDocumentKind::classify(timbrado_norm.as_deref(), cdc_norm.as_deref()).is_none() {
+        tracing::warn!("add_ticket: rejected (cdc without timbrado)");
+        return Err(api_error(StatusCode::BAD_REQUEST, "invalid cdc"));
+    }
+    // Cross-consistency (CDC number blocks vs ticket number) is checked
+    // here; emitter-RUC consistency needs the partner row, so
+    // `db::create_ticket` re-checks both with the real RUC.
+    if let (Some(ref c),) = (cdc_norm.as_ref(),)
+        && Cdc::parse(c)
+            .map(|cdc| cdc.invoice_number().as_str().to_string())
+            .unwrap_or_default()
+            != number.as_str()
+    {
+        tracing::warn!("add_ticket: rejected (cdc number mismatch)");
+        return Err(api_error(StatusCode::BAD_REQUEST, "invalid cdc"));
+    }
+    Ok((number.as_str().to_string(), timbrado_norm, cdc_norm))
 }
 
 /// `POST /api/v1/partners/login` — authenticates a pharmacy and mints its JWT.
@@ -300,7 +405,11 @@ pub async fn request_client_otp(
 /// `POST /api/v1/clients/otp/verify` — exchanges the login code for a JWT.
 ///
 /// Checks the 6-digit code for `ci` and returns a [`LoginResponse`] whose
-/// token expires after 1 hour. Wrong codes count toward lockout.
+/// token expires after 1 hour. Wrong codes count toward lockout. Besides the
+/// JSON token body (kept in `localStorage` for API calls), the response also
+/// sets the `lab_client_token` session cookie so plain browser navigations to
+/// the redeem page carry auth for the
+/// [`client_page_auth`](crate::jwt::client_page_auth) middleware.
 ///
 /// # Status codes
 ///
@@ -313,7 +422,7 @@ pub async fn request_client_otp(
 pub async fn verify_client_otp(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ClientOtpVerify>,
-) -> Result<Json<LoginResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     tracing::debug!("otp verification received");
     if request.code.trim().is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "missing code"));
@@ -346,7 +455,14 @@ pub async fn verify_client_otp(
         api_error(StatusCode::INTERNAL_SERVER_ERROR, "token error")
     })?;
     tracing::info!(client_id = client.id, "verify_client_otp: succeeded");
-    Ok(Json(LoginResponse::bearer(token)))
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        format!("{CLIENT_SESSION_COOKIE}={token}; Path=/; SameSite=Lax; Max-Age=3600")
+            .parse()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "token error"))?,
+    );
+    Ok((headers, Json(LoginResponse::bearer(token))).into_response())
 }
 
 /// `POST /api/v1/partners/tickets` — registers an invoice and awards points.
@@ -397,16 +513,18 @@ pub async fn add_ticket(
             return Err(api_error(StatusCode::BAD_REQUEST, "invalid line"));
         }
     }
-    let ticket_number = request.ticket_id.trim().to_string();
-    if ticket_number.is_empty() || ticket_number.len() > 64 {
-        tracing::warn!("add_ticket: rejected (invalid ticket number)");
-        return Err(api_error(StatusCode::BAD_REQUEST, "invalid ticket number"));
-    }
-    let (first_name, last_name) = validate_buyer(
+    let (ticket_number, timbrado, cdc) = validate_fiscal(
+        &request.ticket_id,
+        request.timbrado.as_deref(),
+        request.cdc.as_deref(),
+    )?;
+    let (first_name, last_name, razon_social, domicilio) = validate_buyer(
         request.client.ci,
         request.client.verification_digit,
         &request.client.first_name,
         &request.client.last_name,
+        request.client.razon_social.as_deref(),
+        request.client.domicilio.as_deref(),
         request.client.phone_number.as_deref(),
         request.client.email.as_deref(),
     )?;
@@ -416,11 +534,15 @@ pub async fn add_ticket(
         NewTicket {
             partner_id: request.partner_id,
             ticket_number: &ticket_number,
+            timbrado: timbrado.as_deref(),
+            cdc: cdc.as_deref(),
             client: NewClient {
                 ci: request.client.ci,
                 verification_digit: request.client.verification_digit,
                 first_name: &first_name,
                 last_name: &last_name,
+                razon_social: razon_social.as_deref(),
+                domicilio: domicilio.as_deref(),
                 phone_number: request.client.phone_number.as_deref(),
                 email: request.client.email.as_deref(),
             },
@@ -548,7 +670,7 @@ pub async fn get_client_data(
 /// * `403` for a token scoped to another client (rejected by the
 ///   `client_auth` layer).
 /// * `404` for an unknown client.
-/// * `409` for insufficient points (or an already-spent prize row).
+/// * `409` for insufficient points.
 /// * `422` for a product that is not redeemable.
 /// * `500` on DB failures.
 #[tracing::instrument(skip(state, request), fields(client_id, items = request.items.len()))]
@@ -595,4 +717,50 @@ pub async fn redeem_points(
         redeemed_points: redeemed.redeemed_points,
         remaining_points: redeemed.remaining_points,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body;
+
+    /// Pool over the dev database (`LAB_DB_URL`, defaulting to the local
+    /// `lab` database). Requires the seed client (`ci` 1234567) to exist;
+    /// performs no writes.
+    async fn test_state() -> Arc<AppState> {
+        let url = std::env::var("LAB_DB_URL")
+            .unwrap_or_else(|_| "postgres://lab:lab@127.0.0.1:5432/lab".to_string());
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        AppState::for_tests(pool)
+    }
+
+    /// A successful OTP verification answers the JSON token body *and* sets
+    /// the `lab_client_token` session cookie the page middleware reads.
+    #[tokio::test]
+    async fn verify_sets_session_cookie() {
+        unsafe {
+            std::env::set_var("LAB_JWT_SECRET", "test-secret");
+            std::env::set_var("LAB_OTP_SECRET", "test-secret");
+        }
+        let state = test_state().await;
+        let secret = otp::otp_secret().unwrap();
+        let code = otp::generate_code(&secret, 1234567, otp::current_window());
+        let res = verify_client_otp(State(state), Json(ClientOtpVerify { ci: 1234567, code }))
+            .await
+            .unwrap()
+            .into_response();
+        let cookie = res
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with("lab_client_token="), "{cookie}");
+        assert!(cookie.contains("Path=/"), "{cookie}");
+        let raw = body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let payload: LoginResponse = serde_json::from_slice(&raw).unwrap();
+        assert!(!payload.token.is_empty());
+        assert!(cookie.contains(&payload.token));
+    }
 }

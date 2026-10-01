@@ -9,6 +9,11 @@
 //! JSON REST API ([`crate::routes::api`]) with the client JWT from
 //! `localStorage`, so no credential ever renders server-side without the
 //! [`client_auth`](crate::jwt::client_auth) layer having checked it.
+//!
+//! The redeem page itself sits behind
+//! [`client_page_auth`]: unauthenticated `GET`
+//! navigations never render and are bounced with `303 See Other` to
+//! `/clients/login?next=<path>`.
 use std::sync::Arc;
 
 use askama::Template;
@@ -16,24 +21,29 @@ use axum::{
     Router,
     extract::{Path, State},
     http::StatusCode,
+    middleware,
     response::{Html, IntoResponse},
     routing::get,
 };
 use tracing::error;
 
-use crate::{AppState, db};
+use crate::{AppState, db, jwt::client_page_auth};
 
-/// Builds the frontend router: `/`, `/clients/login` and
-/// `/clients/{client_id}/redeem`.
+/// Builds the frontend router: `/`, `/clients/login` (both public) and
+/// `/clients/{client_id}/redeem` (behind [`client_page_auth`], which redirects
+/// unauthenticated `GET` navigations to the login page).
 ///
 /// # Errors
 ///
 /// Currently infallible; returns [`anyhow::Error`] to allow future fallible setup.
 pub fn create_frontend() -> anyhow::Result<Router<Arc<AppState>>> {
+    let protected = Router::new()
+        .route("/clients/{client_id}/redeem", get(client_redeem_page))
+        .route_layer(middleware::from_fn(client_page_auth));
     Ok(Router::new()
         .route("/", get(root))
         .route("/clients/login", get(client_login_page))
-        .route("/clients/{client_id}/redeem", get(client_redeem_page)))
+        .merge(protected))
 }
 
 /// Static fallback page served when an Askama template fails to render.

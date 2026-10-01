@@ -2,7 +2,10 @@
 /// Each model derives `Serialize`, `Deserialize`, `Clone`, `Debug`,
 /// `PartialEq`, `PartialOrd` and `FromRow` from `sqlx::FromRow`.
 ///
-/// See `lab/database/schema.sql` for the full schema.
+/// Fiscal identity (invoice number, timbrado, CDC, RUC) is validated by the
+/// value types in [`crate::fiscal`] (see `lab/database/schema.sql` CHECKs).
+/// Prices, IVA, sale conditions and totals are intentionally absent: they are
+/// irrelevant for the loyalty-points domain.
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -16,18 +19,24 @@ use chrono::{DateTime, Utc};
 /// create table partners (
 ///     id serial not null primary key,
 ///     name varchar(32) not null,
-///     ruc varchar(32) not null unique,
+///     ruc varchar(32) not null unique check (ruc ~ '^[0-9]{1,8}-[0-9]$'),
 ///     psk_hash text not null,
-///     is_active boolean not null default true
+///     is_active boolean not null default true,
+///     domicilio varchar(128) not null default 'N/A',
+///     actividad_economica varchar(64) not null default 'N/A'
 /// );
 /// ```
+///
+/// Emisor fiscal: `name` is the razón social, `ruc` is `base-DV` validated
+/// with [`crate::fiscal::Ruc`] (mod-11), plus the address (`domicilio`) and
+/// the economic activity printed on the factura.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct Partners {
     /// `partners.id` primary key.
     pub id: i32,
-    /// `partners.name` display name (`varchar(32)`).
+    /// `partners.name` razón social (`varchar(32)`).
     pub name: String,
-    /// `partners.ruc` tax id (`varchar(32)`, unique), the login natural key.
+    /// `partners.ruc` `base-DV` (`varchar(32)`, unique), the login natural key.
     pub ruc: String,
     /// Argon2 PHC hash of the partner pre-shared key (`psk_hash`).
     ///
@@ -36,6 +45,10 @@ pub struct Partners {
     pub psk_hash: String,
     /// `partners.is_active`; inactive partners cannot log in or bill.
     pub is_active: bool,
+    /// `partners.domicilio` fiscal address printed on the factura.
+    pub domicilio: String,
+    /// `partners.actividad_economica` activity printed on the factura.
+    pub actividad_economica: String,
 }
 
 // ============================================================
@@ -52,6 +65,8 @@ pub struct Partners {
 ///     ),
 ///     first_name varchar(32) not null,
 ///     last_name varchar(32) not null,
+///     razon_social varchar(64) null,
+///     domicilio varchar(128) null,
 ///     phone_number varchar(13) null check (
 ///         email is not null or phone_number is not null
 ///     ),
@@ -61,20 +76,28 @@ pub struct Partners {
 /// );
 /// ```
 ///
-/// Every client has at least one OTP channel: `phone_number` (SMS),
-/// `email`, or both.
+/// Receptor fiscal: personas físicas use `first_name`/`last_name` + CI;
+/// personas jurídicas use `razon_social` + RUC (`ci`-`verification_digit`,
+/// DV verified with [`crate::fiscal::Ruc`]). `domicilio` is the address
+/// printed on the factura. Every client has at least one OTP channel:
+/// `phone_number` (SMS), `email`, or both.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct Clients {
     /// `clients.id` primary key.
     pub id: i32,
-    /// `clients.ci` national id, unique and `>= 0`; identifies the client alone.
+    /// `clients.ci` national id / RUC base, unique and `>= 0`.
     pub ci: i32,
-    /// Optional `<ci>-<digit>` RUC suffix digit (`0-9`); never required.
+    /// RUC check digit: `<ci>-<digit>`; when present its mod-11 must match
+    /// `ci` (see [`crate::fiscal::Ruc`]).
     pub verification_digit: Option<i32>,
     /// `clients.first_name` (`varchar(32)`).
     pub first_name: String,
     /// `clients.last_name` (`varchar(32)`).
     pub last_name: String,
+    /// `clients.razon_social` company name for juridical receptors, if any.
+    pub razon_social: Option<String>,
+    /// `clients.domicilio` fiscal address printed on the factura, if known.
+    pub domicilio: Option<String>,
     /// `clients.phone_number` (`varchar(13)`); SMS channel for OTP codes.
     pub phone_number: Option<String>,
     /// `clients.email` (`varchar(128)`); email channel for OTP codes.
@@ -151,23 +174,37 @@ pub struct RedeemableProducts {
 /// ```sql
 /// create table tickets (
 ///     id serial not null primary key,
-///     ticket_id varchar(64) not null,
+///     ticket_id varchar(64) not null check (
+///         ticket_id ~ '^[0-9]{3}-[0-9]{3}-[0-9]{7}$'
+///     ),
+///     timbrado char(8) null check (timbrado ~ '^[0-9]{8}$'),
+///     cdc char(44) null unique check (cdc ~ '^[0-9]{44}$'),
 ///     date timestamptz not null default current_timestamp,
 ///     partner_id int not null references partners(id),
 ///     client_id int not null references clients(id),
-///     unique (partner_id, ticket_id)
+///     unique (partner_id, ticket_id),
+///     check (cdc is null or timbrado is not null)
 /// );
 /// ```
 ///
-/// `ticket_id` is the invoice number printed on the factura, scoped per
-/// partner (`unique (partner_id, ticket_id)`): two pharmacies may reuse the
-/// same number, one pharmacy may not.
+/// Fiscal identity per <https://4invoices.net/py/modelo-factura>:
+/// `ticket_id` is the printed number `EEE-PPP-NNNNNNN` (see
+/// [`crate::fiscal::InvoiceNumber`]), scoped per partner
+/// (`unique (partner_id, ticket_id)`). `timbrado` is the 8-digit DNIT
+/// authorization ([`crate::fiscal::Timbrado`]); `cdc` is the 44-digit SIFEN
+/// code ([`crate::fiscal::Cdc`], globally unique). Three cases are accepted:
+/// paper (number only), timbrado paper (number + timbrado) and electronic
+/// (number + timbrado + CDC); CDC without timbrado is rejected.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct Tickets {
     /// `tickets.id` primary key (internal; never the invoice number).
     pub id: i32,
-    /// `tickets.ticket_id`: invoice number from the factura (`varchar(64)`).
+    /// Printed invoice number `EEE-PPP-NNNNNNN` (see [`crate::fiscal`]).
     pub ticket_id: String,
+    /// 8-digit DNIT timbrado, if the invoice carries one.
+    pub timbrado: Option<String>,
+    /// 44-digit SIFEN CDC, if the invoice is electronic.
+    pub cdc: Option<String>,
     /// `tickets.date` issue timestamp (defaults to `current_timestamp`).
     pub date: DateTime<Utc>,
     /// `partners.id` of the issuing pharmacy.
@@ -349,15 +386,12 @@ pub struct Redemptions {
 ///
 /// NOTE: despite its name, `product_id` references
 /// [`redeemable_products.id`](RedeemableProducts) (the catalog entry), not
-/// [`products.id`](Products). The API still accepts `products.id` lines and
+/// [`products.id`](Products) — redemption prices come from the redeemable
+/// catalog only. The API still accepts `products.id` lines and
 /// [`crate::db`] resolves them to the catalog entry. `points_per_unit`
 /// snapshots the price at redemption time so later catalog changes do not
-/// rewrite history.
-///
-/// NOTE: the schema declares `product_id` globally `unique`, so a catalog
-/// entry can only ever appear in a single redemption row. That looks like a
-/// schema bug (probably `unique (redemption_id, product_id)` was intended);
-/// the DB layer surfaces the resulting conflict as HTTP `409`.
+/// rewrite history. Repeat redemptions of the same prize are allowed (no
+/// uniqueness beyond the primary key).
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize, FromRow)]
 pub struct RedemptionItems {
     /// `redemption_items.id` primary key.

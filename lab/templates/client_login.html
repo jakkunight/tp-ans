@@ -97,6 +97,18 @@
     const payload = await res.json();
     if (payload && payload.token) {
       localStorage.setItem("lab_client_token", payload.token);
+      // Mirror the token into the session cookie as a fallback: the server
+      // also sets it via Set-Cookie, and the redeem page middleware accepts
+      // either transport for plain navigations.
+      document.cookie =
+        "lab_client_token=" + payload.token + "; Path=/; SameSite=Lax; Max-Age=3600";
+      // The page middleware bounces unauthenticated visits here with
+      // ?next=<page>; go back there when it points at our own client pages.
+      const next = new URLSearchParams(window.location.search).get("next");
+      if (next && next.startsWith("/clients/")) {
+        window.location.href = next;
+        return;
+      }
       // The JWT payload carries client_id; decode it to jump to the redeem page.
       try {
         const claims = JSON.parse(atob(payload.token.split(".")[1]));
