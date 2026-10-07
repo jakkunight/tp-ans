@@ -145,6 +145,19 @@ pub fn create_api(state: &Arc<AppState>) -> anyhow::Result<Router<Arc<AppState>>
     Ok(router)
 }
 
+/// Buyer input for ticket creation validation.
+#[derive(Debug, Clone)]
+struct BuyerInput<'a> {
+    ci: i32,
+    verification_digit: Option<i32>,
+    first_name: &'a str,
+    last_name: &'a str,
+    razon_social: Option<&'a str>,
+    domicilio: Option<&'a str>,
+    phone_number: Option<&'a str>,
+    email: Option<&'a str>,
+}
+
 /// Validates buyer fields shared by ticket creation.
 ///
 /// Returns trimmed `(first_name, last_name, razon_social, domicilio)`.
@@ -153,30 +166,21 @@ pub fn create_api(state: &Arc<AppState>) -> anyhow::Result<Router<Arc<AppState>>
 ///
 /// Returns `400` for invalid CI, names, verification digit (range + mod-11
 /// RUC check), razon social, domicilio or contacts.
-fn validate_buyer(
-    ci: i32,
-    verification_digit: Option<i32>,
-    first_name: &str,
-    last_name: &str,
-    razon_social: Option<&str>,
-    domicilio: Option<&str>,
-    phone_number: Option<&str>,
-    email: Option<&str>,
-) -> Result<(String, String, Option<String>, Option<String>), ApiError> {
+fn validate_buyer(input: BuyerInput<'_>) -> Result<(String, String, Option<String>, Option<String>), ApiError> {
     // Values are not logged: CI, names and contacts are sensitive.
     use crate::fiscal::Ruc;
-    if ci < 0 {
+    if input.ci < 0 {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid buyer ci"));
     }
-    let first_name = first_name.trim().to_string();
-    let last_name = last_name.trim().to_string();
+    let first_name = input.first_name.trim().to_string();
+    let last_name = input.last_name.trim().to_string();
     if first_name.is_empty() || last_name.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "missing buyer name"));
     }
     if first_name.len() > 32 || last_name.len() > 32 {
         return Err(api_error(StatusCode::BAD_REQUEST, "buyer name too long"));
     }
-    if let Some(vd) = verification_digit {
+    if let Some(vd) = input.verification_digit {
         if !(0..=9).contains(&vd) {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
@@ -184,7 +188,7 @@ fn validate_buyer(
             ));
         }
         // `<ci>-<digit>` must be a valid RUC (DNIT mod-11).
-        let candidate = format!("{ci}-{vd}");
+        let candidate = format!("{}-{}", input.ci, vd);
         if Ruc::parse(&candidate).is_err() {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
@@ -192,7 +196,7 @@ fn validate_buyer(
             ));
         }
     }
-    let razon_social = match razon_social {
+    let razon_social = match input.razon_social {
         None => None,
         Some(raw) => {
             let t = raw.trim().to_string();
@@ -208,7 +212,7 @@ fn validate_buyer(
             }
         }
     };
-    let domicilio = match domicilio {
+    let domicilio = match input.domicilio {
         None => None,
         Some(raw) => {
             let t = raw.trim().to_string();
@@ -224,13 +228,13 @@ fn validate_buyer(
             }
         }
     };
-    if let Some(phone) = phone_number {
+    if let Some(phone) = input.phone_number {
         // `varchar(13)`: e.g. `+595981123456`.
         if phone.trim().is_empty() || phone.len() > 13 {
             return Err(api_error(StatusCode::BAD_REQUEST, "invalid buyer contact"));
         }
     }
-    if let Some(email) = email
+    if let Some(email) = input.email
         && (email.trim().is_empty() || email.len() > 128 || !email.contains('@'))
     {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid buyer contact"));
@@ -284,7 +288,7 @@ fn validate_fiscal(
     // Cross-consistency (CDC number blocks vs ticket number) is checked
     // here; emitter-RUC consistency needs the partner row, so
     // `db::create_ticket` re-checks both with the real RUC.
-    if let (Some(ref c),) = (cdc_norm.as_ref(),)
+    if let (Some(c),) = (cdc_norm.as_ref(),)
         && Cdc::parse(c)
             .map(|cdc| cdc.invoice_number().as_str().to_string())
             .unwrap_or_default()
@@ -518,16 +522,16 @@ pub async fn add_ticket(
         request.timbrado.as_deref(),
         request.cdc.as_deref(),
     )?;
-    let (first_name, last_name, razon_social, domicilio) = validate_buyer(
-        request.client.ci,
-        request.client.verification_digit,
-        &request.client.first_name,
-        &request.client.last_name,
-        request.client.razon_social.as_deref(),
-        request.client.domicilio.as_deref(),
-        request.client.phone_number.as_deref(),
-        request.client.email.as_deref(),
-    )?;
+    let (first_name, last_name, razon_social, domicilio) = validate_buyer(BuyerInput {
+        ci: request.client.ci,
+        verification_digit: request.client.verification_digit,
+        first_name: &request.client.first_name,
+        last_name: &request.client.last_name,
+        razon_social: request.client.razon_social.as_deref(),
+        domicilio: request.client.domicilio.as_deref(),
+        phone_number: request.client.phone_number.as_deref(),
+        email: request.client.email.as_deref(),
+    })?;
 
     let created = db::create_ticket(
         &state.db,

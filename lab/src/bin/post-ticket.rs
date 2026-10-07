@@ -360,32 +360,36 @@ fn non_empty_str(raw: &str, what: &str) -> Result<String> {
     Ok(v)
 }
 
+/// Inputs for building a ticket buyer from CLI flags.
+#[derive(Debug, Clone)]
+struct BuyerFlags<'a> {
+    ci: Option<&'a str>,
+    first_name: Option<&'a str>,
+    last_name: Option<&'a str>,
+    verification_digit: Option<&'a str>,
+    razon_social: Option<&'a str>,
+    domicilio: Option<&'a str>,
+    phone: Option<&'a str>,
+    email: Option<&'a str>,
+}
+
 /// Builds the ticket buyer from raw flag/field values, validating CI, names
 /// and the optional verification digit. Blank optionals become `None`.
-fn build_client(
-    ci: Option<&str>,
-    first_name: Option<&str>,
-    last_name: Option<&str>,
-    verification_digit: Option<&str>,
-    razon_social: Option<&str>,
-    domicilio: Option<&str>,
-    phone: Option<&str>,
-    email: Option<&str>,
-) -> Result<TicketClient> {
+fn build_client(flags: BuyerFlags<'_>) -> Result<TicketClient> {
     let contact = |raw: Option<&str>| {
         raw.map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
     Ok(TicketClient {
-        ci: parse_ci(ci.context("--ci is required")?)?,
-        verification_digit: verification_digit.map(parse_vdigit).transpose()?,
-        first_name: non_empty(first_name, "--first-name")?,
-        last_name: non_empty(last_name, "--last-name")?,
-        razon_social: contact(razon_social),
-        domicilio: contact(domicilio),
-        phone_number: contact(phone),
-        email: contact(email),
+        ci: parse_ci(flags.ci.context("--ci is required")?)?,
+        verification_digit: flags.verification_digit.map(parse_vdigit).transpose()?,
+        first_name: non_empty(flags.first_name, "--first-name")?,
+        last_name: non_empty(flags.last_name, "--last-name")?,
+        razon_social: contact(flags.razon_social),
+        domicilio: contact(flags.domicilio),
+        phone_number: contact(flags.phone),
+        email: contact(flags.email),
     })
 }
 
@@ -589,16 +593,16 @@ async fn run_oneshot(args: &Args) -> Result<()> {
             .context("--partner ID is required")?,
         "partner id",
     )?;
-    let client = build_client(
-        args.ci.as_deref(),
-        args.first_name.as_deref(),
-        args.last_name.as_deref(),
-        args.verification_digit.as_deref(),
-        args.razon_social.as_deref(),
-        args.domicilio.as_deref(),
-        args.phone.as_deref(),
-        args.email.as_deref(),
-    )?;
+    let client = build_client(BuyerFlags {
+        ci: args.ci.as_deref(),
+        first_name: args.first_name.as_deref(),
+        last_name: args.last_name.as_deref(),
+        verification_digit: args.verification_digit.as_deref(),
+        razon_social: args.razon_social.as_deref(),
+        domicilio: args.domicilio.as_deref(),
+        phone: args.phone.as_deref(),
+        email: args.email.as_deref(),
+    })?;
     let details = parse_items(&args.items)?;
     let blank = |raw: &Option<String>| {
         raw.as_deref()
@@ -1065,20 +1069,20 @@ impl App {
             ticket_id: non_empty_str(self.fields[FIELD_TICKET_NO].trim(), "nro. factura")?,
             timbrado: contact(FIELD_TIMBRADO),
             cdc: contact(FIELD_CDC),
-            client: build_client(
-                Some(&self.fields[FIELD_CI]),
-                Some(&self.fields[FIELD_FIRST]),
-                Some(&self.fields[FIELD_LAST]),
-                if self.fields[FIELD_VDIGIT].trim().is_empty() {
+            client: build_client(BuyerFlags {
+                ci: Some(&self.fields[FIELD_CI]),
+                first_name: Some(&self.fields[FIELD_FIRST]),
+                last_name: Some(&self.fields[FIELD_LAST]),
+                verification_digit: if self.fields[FIELD_VDIGIT].trim().is_empty() {
                     None
                 } else {
                     Some(self.fields[FIELD_VDIGIT].as_str())
                 },
-                contact(FIELD_RAZON).as_deref(),
-                contact(FIELD_DOMICILIO).as_deref(),
-                contact(FIELD_PHONE).as_deref(),
-                contact(FIELD_EMAIL).as_deref(),
-            )?,
+                razon_social: contact(FIELD_RAZON).as_deref(),
+                domicilio: contact(FIELD_DOMICILIO).as_deref(),
+                phone: contact(FIELD_PHONE).as_deref(),
+                email: contact(FIELD_EMAIL).as_deref(),
+            })?,
             details: parse_items(&self.items)?,
         };
         self.busy = true;
@@ -1320,8 +1324,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     );
 
     // Cursor on the focused, visible text field.
-    if let Some(frow) = focus_row {
-        if frow >= app.scroll && frow < app.scroll + capacity.max(1) {
+    if let Some(frow) = focus_row
+        && frow >= app.scroll && frow < app.scroll + capacity.max(1) {
             let len = match app.focus_item() {
                 Focus::Field(i) => app.fields[i].len(),
                 Focus::Item(i) => app.items.get(i).map(String::len).unwrap_or(0),
@@ -1334,7 +1338,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 row_y,
             ));
         }
-    }
 }
 
 /// Appends a typed character to the focused text field or product line.
@@ -1384,55 +1387,52 @@ async fn run_tui(args: &Args) -> Result<()> {
             .await
             .context("event thread failed")?
             .map_err(|e| anyhow::anyhow!("event read failed: {e}"))?;
-        match ev {
-            Event::Key(key) => match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) => break Ok(()),
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
-                (KeyCode::Char('l'), KeyModifiers::CONTROL) => app.do_login().await,
-                (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.do_post().await,
-                (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.do_delete().await,
-                (KeyCode::Tab, _) => app.next(),
-                (KeyCode::BackTab, _) => app.prev(),
-                (KeyCode::Down, _) => app.next(),
-                (KeyCode::Up, _) => app.prev(),
-                (KeyCode::PageDown, _) => app.page(1),
-                (KeyCode::PageUp, _) => app.page(-1),
-                (KeyCode::Enter, _) => match app.focus_item() {
-                    Focus::Button(BTN_LOGIN) => app.do_login().await,
-                    Focus::Button(BTN_POST) => app.do_post().await,
-                    Focus::Button(BTN_DELETE) => app.do_delete().await,
-                    Focus::Section(_) => app.toggle_section(),
-                    _ => app.next(),
-                },
-                // Space on a section header folds/unfolds it, elsewhere it types.
-                (KeyCode::Char(' '), _) if app.is_section_focus() => app.toggle_section(),
-                // On a product line, +/- manage lines instead of typing.
-                (KeyCode::Char('+'), m)
-                    if (m.is_empty() || m == KeyModifiers::SHIFT)
-                        && app.focused_item().is_some() =>
-                {
-                    app.add_item_line();
-                }
-                (KeyCode::Char('-'), m)
-                    if (m.is_empty() || m == KeyModifiers::SHIFT)
-                        && app.focused_item().is_some() =>
-                {
-                    app.remove_item_line();
-                }
-                (KeyCode::Delete, _) if app.focused_item().is_some() => {
-                    app.remove_item_line();
-                }
-                (KeyCode::Backspace, _) => {
-                    on_backspace(&mut app);
-                }
-                (KeyCode::Left, _) | (KeyCode::Right, _) => {}
-                (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                    on_char(&mut app, c);
-                }
-                _ => {}
+        if let Event::Key(key) = ev { match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => break Ok(()),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+            (KeyCode::Char('l'), KeyModifiers::CONTROL) => app.do_login().await,
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.do_post().await,
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.do_delete().await,
+            (KeyCode::Tab, _) => app.next(),
+            (KeyCode::BackTab, _) => app.prev(),
+            (KeyCode::Down, _) => app.next(),
+            (KeyCode::Up, _) => app.prev(),
+            (KeyCode::PageDown, _) => app.page(1),
+            (KeyCode::PageUp, _) => app.page(-1),
+            (KeyCode::Enter, _) => match app.focus_item() {
+                Focus::Button(BTN_LOGIN) => app.do_login().await,
+                Focus::Button(BTN_POST) => app.do_post().await,
+                Focus::Button(BTN_DELETE) => app.do_delete().await,
+                Focus::Section(_) => app.toggle_section(),
+                _ => app.next(),
             },
+            // Space on a section header folds/unfolds it, elsewhere it types.
+            (KeyCode::Char(' '), _) if app.is_section_focus() => app.toggle_section(),
+            // On a product line, +/- manage lines instead of typing.
+            (KeyCode::Char('+'), m)
+                if (m.is_empty() || m == KeyModifiers::SHIFT)
+                    && app.focused_item().is_some() =>
+            {
+                app.add_item_line();
+            }
+            (KeyCode::Char('-'), m)
+                if (m.is_empty() || m == KeyModifiers::SHIFT)
+                    && app.focused_item().is_some() =>
+            {
+                app.remove_item_line();
+            }
+            (KeyCode::Delete, _) if app.focused_item().is_some() => {
+                app.remove_item_line();
+            }
+            (KeyCode::Backspace, _) => {
+                on_backspace(&mut app);
+            }
+            (KeyCode::Left, _) | (KeyCode::Right, _) => {}
+            (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                on_char(&mut app, c);
+            }
             _ => {}
-        }
+        } }
     };
 
     crossterm::terminal::disable_raw_mode().ok();
