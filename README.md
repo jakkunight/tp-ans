@@ -19,6 +19,49 @@ educativos.
 - Tailwind CSS
 - SQLx
 
+## Instalación y ejecución (sin Nix/devenv)
+
+La forma principal de desarrollo es con Nix + devenv (ver `devenv.nix`).
+Si no usás Nix, hay scripts en `scripts/` que instalan todo y ejecutan
+el proyecto en cada sistema operativo:
+
+| Script                          | SO            | Qué hace                                              |
+| ------------------------------- | ------------- | ----------------------------------------------------- |
+| `scripts/install-linux.sh`      | Linux         | Instala base, Postgres, Rust, Bun, sqlx, sops/age, secretspec (apt/dnf/pacman) |
+| `scripts/install-macos.sh`      | macOS         | Idem vía Homebrew (+ Xcode CLT, inicia Postgres)      |
+| `scripts/install-windows.ps1`   | Windows       | Idem vía winget (+ Build Tools MSVC, inicia Postgres) |
+| `scripts/run.sh`                | Linux / macOS | Crea rol/BD, aplica `schema.sql` + `seed.sql` y corre el servidor |
+| `scripts/run-windows.ps1`       | Windows       | Idem en PowerShell                                    |
+| `scripts/secrets-decode.sh`     | Linux / macOS | Decodifica `secrets.enc.yaml` con secretspec/sops     |
+| `scripts/secrets-decode.ps1`    | Windows       | Idem en PowerShell                                    |
+
+```bash
+# Linux (Debian/Ubuntu, Fedora, Arch)
+./scripts/install-linux.sh
+./scripts/run.sh            # servidor en http://127.0.0.1:8080
+
+# macOS
+./scripts/install-macos.sh
+./scripts/run.sh
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+powershell -ExecutionPolicy Bypass -File scripts\run-windows.ps1
+```
+
+```bash
+# Decodificar secretos (requiere la clave age del equipo en
+# ~/.config/sops/age/dev-key.txt; nunca la subas al repo)
+./scripts/secrets-decode.sh                 # genera secrets.dec.yaml
+./scripts/secrets-decode.sh --env-out .env  # además genera .env
+```
+
+Sin la clave age, `run.*` usa valores de desarrollo por defecto
+(`lab/lab`, JWT de prueba, OTP por log). Las PSK de prueba están en la
+cabecera de `lab/database/seed.sql` (`central-2026`, `sur-2026`).
+
 ## Problema a resolver
 
 Un laboratorio de medicamentos (lab) cuenta con un programa de fidelización de
