@@ -9,120 +9,20 @@
     Ingresá tu CI y te enviamos un código de 6 dígitos por SMS o email.
     El código vence en 5 minutos.
   </p>
-  <form id="otp-request-form" class="flex flex-col gap-3">
+  <form hx-post="/clients/otp/request" hx-target="#otp-step" hx-swap="innerHTML" class="flex flex-col gap-3">
     <label class="flex flex-col gap-1">
       <span>CI</span>
       <input class="border rounded px-3 py-2" type="number" name="ci" min="0" required placeholder="Ej. 1234567" />
     </label>
+    {% if next != "" %}
+    <input type="hidden" name="next" value="{{ next }}" />
+    {% endif %}
     <button class="border rounded px-3 py-2 font-semibold" type="submit">Enviar código</button>
   </form>
-  <form id="otp-verify-form" class="hidden flex-col gap-3 mt-4">
-    <p class="text-sm opacity-80" id="otp-sent-info"></p>
-    <label class="flex flex-col gap-1">
-      <span>Código de 6 dígitos</span>
-      <input class="border rounded px-3 py-2 font-mono" type="text" name="code" inputmode="numeric"
-             pattern="[0-9]{6}" maxlength="6" required placeholder="Ej. 482913" />
-    </label>
-    <button class="border rounded px-3 py-2 font-semibold" type="submit">Ingresar</button>
-  </form>
-  <p id="client-login-error" class="text-sm mt-3" role="alert"></p>
+  <!-- Step 2 (verify form + result) is rendered here by POST /clients/otp/request. -->
+  <div id="otp-step"></div>
+  <noscript>
+    <p class="text-sm mt-3" role="alert">Esta página necesita HTMX para funcionar. Activá JavaScript.</p>
+  </noscript>
 </main>
-<script>
-  const reqForm = document.getElementById("otp-request-form");
-  const verForm = document.getElementById("otp-verify-form");
-  const sentInfo = document.getElementById("otp-sent-info");
-  const errBox = document.getElementById("client-login-error");
-  let ci = null;
-
-  reqForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    errBox.textContent = "";
-    const data = new FormData(reqForm);
-    ci = Number(data.get("ci"));
-    let res;
-    try {
-      res = await fetch("/api/v1/clients/otp/request", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ci }),
-      });
-    } catch {
-      errBox.textContent = "No se pudo contactar al servidor.";
-      return;
-    }
-    if (res.status === 404) {
-      errBox.textContent = "Ese CI no está registrado. Pedí en tu farmacia que te registren.";
-      return;
-    }
-    if (res.status === 429) {
-      errBox.textContent = "Demasiados intentos. Esperá unos minutos y probá de nuevo.";
-      return;
-    }
-    if (!res.ok) {
-      errBox.textContent = "No se pudo enviar el código. Verificá tu CI.";
-      return;
-    }
-    const payload = await res.json();
-    sentInfo.textContent =
-      "Código enviado por " + (payload.channel || "SMS") +
-      " a " + (payload.destination_masked || "") + ".";
-    verForm.classList.remove("hidden");
-    verForm.classList.add("flex");
-  });
-
-  verForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    errBox.textContent = "";
-    const data = new FormData(verForm);
-    const body = { ci, code: String(data.get("code") || "") };
-    let res;
-    try {
-      res = await fetch("/api/v1/clients/otp/verify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    } catch {
-      errBox.textContent = "No se pudo contactar al servidor.";
-      return;
-    }
-    if (res.status === 429) {
-      errBox.textContent = "Cuenta bloqueada por intentos fallidos. Esperá 15 minutos.";
-      return;
-    }
-    if (!res.ok) {
-      errBox.textContent = "Código inválido o vencido. Pedí uno nuevo si hace falta.";
-      return;
-    }
-    const payload = await res.json();
-    if (payload && payload.token) {
-      localStorage.setItem("lab_client_token", payload.token);
-      // Mirror the token into the session cookie as a fallback: the server
-      // also sets it via Set-Cookie, and the redeem page middleware accepts
-      // either transport for plain navigations.
-      document.cookie =
-        "lab_client_token=" + payload.token + "; Path=/; SameSite=Lax; Max-Age=3600";
-      // The page middleware bounces unauthenticated visits here with
-      // ?next=<page>; go back there when it points at our own client pages.
-      const next = new URLSearchParams(window.location.search).get("next");
-      if (next && next.startsWith("/clients/")) {
-        window.location.href = next;
-        return;
-      }
-      // The JWT payload carries client_id; decode it to jump to the redeem page.
-      try {
-        const claims = JSON.parse(atob(payload.token.split(".")[1]));
-        const clientId = claims.client_id;
-        if (clientId !== undefined && clientId !== null && String(clientId).length > 0) {
-          window.location.href = "/clients/" + encodeURIComponent(String(clientId)) + "/redeem";
-          return;
-        }
-      } catch {}
-      const manual = prompt("Sesión iniciada. Ingresá tu ID de cliente para continuar:");
-      if (manual) {
-        window.location.href = "/clients/" + encodeURIComponent(manual.trim()) + "/redeem";
-      }
-    }
-  });
-</script>
 {% endblock %}

@@ -1,0 +1,55 @@
+{# Shared redeem dashboard region: rendered by client_redeem.html via
+   {% include %} (context: `dash`) and standalone by the redeem fragment.
+   The form swaps fresh copies of this region over #dashboard, so balances,
+   the message and row affordability always update together. #}
+<main id="dashboard" class="max-w-2xl mx-auto p-6 flex flex-col gap-6">
+  <section>
+    <h1 class="text-2xl font-bold">Canjear puntos</h1>
+    <p class="text-sm opacity-80">
+      Cliente: <strong id="client-name">{{ dash.first_name }} {{ dash.last_name }}</strong>
+      <span id="client-ids">(CI {{ dash.ci }}, ID {{ dash.client_id }})</span>
+    </p>
+    <p class="mt-2">
+      Puntos acumulados: <strong id="points-balance">{{ dash.balance_points }}</strong>
+      <span class="text-sm opacity-70" id="points-breakdown">(ganados: {{ dash.total_earned_points }}, canjeados: {{ dash.total_redeemed_points }}{% if dash.cancelled_points > 0 %}, anulados: {{ dash.cancelled_points }}{% endif %})</span>
+    </p>
+  </section>
+
+  <section>
+    <h2 class="text-xl font-semibold mb-2">Productos canjeables</h2>
+    {% if dash.products.is_empty() %}
+    <p class="text-sm">No hay productos canjeables por el momento.</p>
+    {% else %}
+    <form hx-post="/clients/{{ dash.client_id }}/redeem" hx-target="#dashboard" hx-swap="outerHTML" class="flex flex-col gap-2">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-left border-b">
+            <th class="py-2">Producto</th>
+            <th class="py-2">Puntos</th>
+            <th class="py-2">Cantidad</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in dash.products %}
+          <tr class="border-b{% if p.affordable %}{% else %} opacity-50{% endif %}">
+            <td class="py-2">
+              <div class="font-semibold">{{ p.name }}</div>
+              <div class="opacity-70">{{ p.description }}{% if p.affordable %}{% else %} (te faltan puntos){% endif %}</div>
+            </td>
+            <td class="py-2 font-mono">{{ p.points_needed }}</td>
+            <td class="py-2">
+              <input class="border rounded px-2 py-1 w-20" type="number"
+                     min="0" value="0" name="qty_{{ p.product_id }}"{% if p.affordable %}{% else %} disabled{% endif %} />
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <button class="border rounded px-3 py-2 font-semibold mt-2" type="submit"{% if dash.all_disabled %} disabled{% endif %}>Canjear</button>
+    </form>
+    {% endif %}
+    {% if let Some(msg) = dash.message %}
+    <p class="text-sm mt-3" role="{% if dash.message_is_error %}alert{% else %}status{% endif %}">{{ msg }}</p>
+    {% endif %}
+  </section>
+</main>
