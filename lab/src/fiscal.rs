@@ -102,21 +102,25 @@ impl InvoiceNumber {
     }
 
     /// `(establecimiento, punto, numero)` blocks.
+    #[allow(dead_code)]
     pub fn parts(&self) -> (&str, &str, &str) {
         (&self.0[0..3], &self.0[4..7], &self.0[8..15])
     }
 
     /// Establishment block (`EEE`).
+    #[allow(dead_code)]
     pub fn establishment(&self) -> &str {
         self.parts().0
     }
 
     /// Point-of-sale block (`PPP`).
+    #[allow(dead_code)]
     pub fn point(&self) -> &str {
         self.parts().1
     }
 
     /// Sequential block (`NNNNNNN`).
+    #[allow(dead_code)]
     pub fn number(&self) -> &str {
         self.parts().2
     }
@@ -155,6 +159,7 @@ impl Timbrado {
     }
 
     /// Raw form.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -215,16 +220,19 @@ impl Ruc {
     }
 
     /// Computes the DV for a numeric base (no validation of length).
+    #[allow(dead_code)]
     pub fn dv_for(base: &str) -> Option<u8> {
         mod11_dv(base.trim())
     }
 
     /// Canonical `base-DV` form.
+    #[allow(dead_code)]
     pub fn as_string(&self) -> String {
         format!("{}-{}", self.base, self.dv)
     }
 
     /// Base zero-padded to 8 digits (CDC emitter field).
+    #[allow(dead_code)]
     pub fn base_padded8(&self) -> String {
         format!("{:0>8}", self.base)
     }
@@ -393,7 +401,7 @@ fn valid_yyyymmdd(s: &str) -> bool {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) {
                 29
             } else {
                 28

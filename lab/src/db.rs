@@ -299,6 +299,7 @@ pub async fn find_or_create_client(
 /// # Errors
 ///
 /// Returns [`DbError::NotFound`] for unknown ids.
+#[allow(dead_code)]
 pub async fn client_by_id(pool: &PgPool, client_id: i32) -> Result<Clients, DbError> {
     sqlx::query_as::<_, Clients>(
         "SELECT id, ci, verification_digit, first_name, last_name, razon_social, domicilio, phone_number, email
