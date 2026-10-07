@@ -19,7 +19,7 @@
 //!
 //! Claim payloads carry internal numeric ids only — never passwords, PSKs,
 //! OTP codes or other secrets.
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     Json,
@@ -212,9 +212,11 @@ pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
             anyhow::bail!(e)
         }
     };
-    let mut validation = Validation::default();
-    validation.validate_exp = false;
-    validation.required_spec_claims.clear();
+    let validation = Validation {
+        validate_exp: false,
+        required_spec_claims: HashSet::new(),
+        ..Default::default()
+    };
     match decode(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
@@ -230,7 +232,7 @@ pub fn validate_token(token: &str) -> anyhow::Result<Claims> {
                 tracing::warn!("validate_token: rejected (expired token)");
                 anyhow::bail!("Token expired")
             }
-            return Ok(claims);
+            Ok(claims)
         }
         Err(e) => {
             tracing::error!("Failed to decode the token");

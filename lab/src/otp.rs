@@ -134,11 +134,10 @@ pub fn channel_for(
 ///
 /// Fails when neither variable is set.
 pub fn otp_secret() -> anyhow::Result<Vec<u8>> {
-    if let Ok(s) = std::env::var("LAB_OTP_SECRET") {
-        if !s.is_empty() {
+    if let Ok(s) = std::env::var("LAB_OTP_SECRET")
+        && !s.is_empty() {
             return Ok(s.into_bytes());
         }
-    }
     match std::env::var("LAB_JWT_SECRET") {
         Ok(s) if !s.is_empty() => Ok(s.into_bytes()),
         _ => anyhow::bail!("LAB_OTP_SECRET (or LAB_JWT_SECRET) must be set"),
@@ -262,15 +261,14 @@ impl OtpGuard {
     /// Returns [`OtpError::Locked`] while a lockout holds.
     pub fn check_not_locked(&self, ci: i32) -> Result<(), OtpError> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.get_mut(&ci) {
-            if let Some(until) = entry.locked_until {
+        if let Some(entry) = guard.get_mut(&ci)
+            && let Some(until) = entry.locked_until {
                 if Utc::now() < until {
                     return Err(OtpError::Locked { retry_after: until });
                 }
                 entry.locked_until = None;
                 entry.failures = 0;
             }
-        }
         Ok(())
     }
 
